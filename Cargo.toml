@@ -1,0 +1,33 @@
+[package]
+name = "vigem-rust"
+version = "0.1.0"
+edition = "2024"
+authors = ["arounre"]
+description = "A safe, ergonomic, and pure Rust interface for the ViGEmBus driver."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arounre/vigem-rust"
+keywords = ["vigem", "gamepad", "controller", "virtual", "xinput"]
+categories = ["api-bindings", "os::windows-apis", "games"]
+
+[dependencies]
+bitflags = "2.10.0"
+thiserror = "2.0.17"
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_System",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+]
+
+[features]
+default = ["x360", "ds4"]
+x360 = []
+ds4 = []
