@@ -107,9 +107,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           $output = cargo build --no-default-features 2>&1 | Out-String
+          $code = $LASTEXITCODE
           Write-Host $output
-          if ($LASTEXITCODE -eq 0) {
+          if ($code -eq 0) {
             Write-Error "expected cargo build --no-default-features to fail"
             exit 1
           }
@@ -118,6 +120,8 @@ jobs:
             exit 1
           }
           Write-Host "OK: no-default-features fails with the expected compile_error"
+          # GitHub's pwsh wrapper exits with LASTEXITCODE (cargo's 1). Force success.
+          exit 0
 
   # 32-bit Windows: compile the SetupAPI `DETAIL_DATA_CB_SIZE` arm.
   check_i686:
