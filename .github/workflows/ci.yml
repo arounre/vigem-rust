@@ -2,16 +2,50 @@ name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master", "release/**"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Formatting is platform-independent; keep it off the Windows matrix so it
+  # fails fast without waiting on a Windows runner + cache restore.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Primary matrix: real feature combos only. `--no-default-features` alone is
+  # intentionally a hard error (see `no_default_features_fails` below).
   build_and_test:
     runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features --features x360"
+          - "--no-default-features --features ds4"
+          - "--all-features"
+        check:
+          - build
+          - clippy
+          - test
+          - doc
 
     steps:
       - name: Checkout repository
@@ -19,6 +53,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache dependencies
         uses: actions/cache@v4
@@ -29,16 +65,166 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.features }}-${{ matrix.check }}
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: matrix.check == 'clippy'
+        run: cargo clippy ${{ matrix.features }} --all-targets --locked -- -D warnings
 
-      - name: Run Clippy
-        run: cargo clippy --all-features
+      - name: Build
+        if: matrix.check == 'build'
+        run: cargo build ${{ matrix.features }} --verbose --locked
 
-      - name: Build project
-        run: cargo build --all-features --release --verbose
+      # Driver-free tests only. `tests/driver_required.rs` is #[ignore] and needs
+      # ViGEmBus installed — run locally with: cargo test -- --ignored
+      - name: Test
+        if: matrix.check == 'test'
+        run: cargo test ${{ matrix.features }} --verbose --locked
 
-      - name: Run tests
-        run: cargo test --all-features --verbose
+      - name: Install nightly for docsrs cfg
+        if: matrix.check == 'doc'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Doc
+        if: matrix.check == 'doc'
+        env:
+          # Match package.metadata.docs.rs rustdoc-args (+ -D warnings).
+          # `doc_cfg` / `feature(doc_cfg)` need nightly; docs.rs uses nightly too.
+          RUSTDOCFLAGS: --cfg docsrs -Zunstable-options --generate-link-to-definition -D warnings
+        run: cargo +nightly doc ${{ matrix.features }} --no-deps --locked
+
+  # Negative test: building with neither controller feature must fail with the
+  # expected compile_error! (not a silent empty crate).
+  no_default_features_fails:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Expect compile_error without x360/ds4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $output = cargo build --no-default-features 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $output
+          if ($code -eq 0) {
+            Write-Error "expected cargo build --no-default-features to fail"
+            exit 1
+          }
+          if ($output -notmatch 'requires at least one of the `x360` or `ds4` features') {
+            Write-Error "expected compile_error about x360/ds4 features"
+            exit 1
+          }
+          Write-Host "OK: no-default-features fails with the expected compile_error"
+          # GitHub's pwsh wrapper exits with LASTEXITCODE (cargo's 1). Force success.
+          exit 0
+
+  # 32-bit Windows: compile the SetupAPI `DETAIL_DATA_CB_SIZE` arm.
+  check_i686:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-i686-${{ hashFiles('**/Cargo.lock') }}
+      - name: cargo check (i686)
+        run: cargo check --target i686-pc-windows-msvc --all-features
+
+  # Non-Windows: only the Windows compile_error! should fire (no windows crate noise).
+  non_windows_compile_error:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Expect Windows-only compile_error
+        shell: bash
+        run: |
+          set +e
+          output=$(cargo build --target x86_64-unknown-linux-gnu --all-features 2>&1)
+          status=$?
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "expected non-Windows build to fail" >&2
+            exit 1
+          fi
+          if ! echo "$output" | grep -q 'vigem-rust requires Windows'; then
+            echo "expected Windows compile_error message" >&2
+            exit 1
+          fi
+          if echo "$output" | grep -qi 'unresolved import.*windows'; then
+            echo "windows crate errors should not appear; modules must be cfg(windows)" >&2
+            exit 1
+          fi
+          echo "OK: non-Windows fails with a single actionable message"
+
+  msrv:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+      - name: cargo check (MSRV 1.88)
+        run: cargo check --all-features --lib --tests --locked
+
+  # Verifies the published tree builds (include_str! README/CHANGELOG, licenses).
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo package (verifies the published tree builds)
+        run: cargo package --all-features --locked
+      - name: List packaged files
+        shell: pwsh
+        run: |
+          $crate = Get-ChildItem target/package/*.crate | Select-Object -First 1
+          if (-not $crate) {
+            Write-Error "no .crate found under target/package/"
+            exit 1
+          }
+          $listing = tar -tzf $crate.FullName
+          Write-Host $listing
+          $required = @(
+            'README.md',
+            'CHANGELOG.md',
+            'LICENSE-MIT',
+            'LICENSE-APACHE'
+          )
+          foreach ($name in $required) {
+            # `-match` on an array returns matching lines; empty => missing.
+            if (-not ($listing -match [regex]::Escape($name))) {
+              Write-Error "packaged crate is missing $name"
+              exit 1
+            }
+          }
+          Write-Host "OK: required package files present"

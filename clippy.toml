@@ -1,0 +1,13 @@
+# Keep Clippy's built-in list (`".."`) and allow domain terms used throughout docs.
+doc-valid-idents = [
+    "ViGEmBus",
+    "ViGEm",
+    "DualShock",
+    "XInput",
+    "XUSB",
+    "HRESULT",
+    "SetupAPI",
+    "DirectInput",
+    "PnP",
+    "..",
+]
