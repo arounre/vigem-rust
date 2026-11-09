@@ -75,12 +75,15 @@ impl NotificationWorker for Ds4NotificationWorker {
     }
 }
 
+/// Bus-wide: the driver ignores the request serial and stamps each completion
+/// with the originating pad's serial. Run one per bus handle and route by
+/// that serial (see `ds4_output_router`).
 #[cfg(feature = "ds4")]
 pub(crate) struct Ds4OutputWorker;
 
 #[cfg(feature = "ds4")]
 impl NotificationWorker for Ds4OutputWorker {
-    type Notification = Ds4OutputBuffer;
+    type Notification = (u32, Ds4OutputBuffer);
     type Request = Ds4AwaitOutput;
 
     const IOCTL_CODE: u32 = IOCTL_DS4_AWAIT_OUTPUT_AVAILABLE;
@@ -96,6 +99,8 @@ impl NotificationWorker for Ds4OutputWorker {
     }
 
     fn process_response(response: &Self::Request) -> Self::Notification {
-        Ds4OutputBuffer::new(response.report.buffer)
+        // Packed struct: copy fields by value, never by reference.
+        let serial_no = response.serial_no;
+        (serial_no, Ds4OutputBuffer::new(response.report.buffer))
     }
 }

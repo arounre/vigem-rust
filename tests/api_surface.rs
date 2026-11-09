@@ -246,3 +246,19 @@ fn public_types_are_send_sync() {
         assert_send::<NotificationReceiver<Ds4OutputBuffer>>();
     }
 }
+
+/// `NotificationReceiver` was `UnwindSafe + RefUnwindSafe` in 0.2.0; dropping
+/// either auto trait would be a breaking change.
+#[test]
+fn notification_receivers_are_unwind_safe() {
+    #[allow(dead_code)]
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    #[cfg(feature = "x360")]
+    assert_unwind_safe::<vigem_rust::NotificationReceiver<vigem_rust::X360Notification>>();
+    #[cfg(feature = "ds4")]
+    {
+        assert_unwind_safe::<vigem_rust::NotificationReceiver<vigem_rust::Ds4Notification>>();
+        assert_unwind_safe::<vigem_rust::NotificationReceiver<vigem_rust::Ds4OutputBuffer>>();
+    }
+}

@@ -46,14 +46,16 @@ use std::{
 use crate::controller::ds4::{Ds4Notification, Ds4OutputBuffer, Ds4Report, Ds4ReportEx};
 #[cfg(feature = "x360")]
 use crate::controller::x360::{X360Notification, X360Report};
+#[cfg(feature = "ds4")]
+use crate::internal::ds4_output_router::Ds4OutputRoute;
 
 use crate::{
     client::{Client, ClientInner},
     error::{BusError, ClientError, Operation, RecvError, RecvTimeoutError, TryRecvError},
     internal::{
         bounded_channel::{self, BoundedReceiver},
-        bus::{Bus, NotificationWorkerHandle},
-        notification_hub::{Fanout, NotificationHub, SubscriberToken},
+        bus::Bus,
+        notification_hub::{Fanout, NotificationHub, SharedFanout, SubscriberToken},
         overlapped::OverlappedCall,
     },
 };
@@ -245,7 +247,7 @@ pub(crate) struct Xbox360Slots {
 #[derive(Default)]
 pub(crate) struct Ds4Slots {
     pub(crate) ds4: Mutex<Weak<NotificationHub<Ds4Notification>>>,
-    pub(crate) ds4_raw: Mutex<Weak<NotificationHub<Ds4OutputBuffer>>>,
+    pub(crate) ds4_raw: Mutex<Weak<Ds4OutputRoute>>,
 }
 
 #[cfg(feature = "x360")]
@@ -774,8 +776,9 @@ impl TargetHandle<DualShock4, Pending> {
 pub struct NotificationReceiver<N> {
     /// Drops first so this subscription is removed before the shared hub tears down.
     _sub: SubscriberToken<N>,
-    /// Keeps shared delivery alive while any receiver still exists.
-    _hub: Arc<NotificationHub<N>>,
+    /// Keeps shared delivery alive while any receiver still exists
+    /// (a per-pad worker hub, or a route on the bus-wide DS4 output router).
+    _hub: Arc<dyn Send + Sync + std::panic::RefUnwindSafe + std::panic::UnwindSafe>,
     rx: BoundedReceiver<Result<N, BusError>>,
 }
 
@@ -883,28 +886,29 @@ impl<N> NotificationReceiver<N> {
     }
 }
 
-/// Join an existing shared worker or spawn a fresh one for this (pad, kind).
+/// Join an existing shared delivery point or start a fresh one for this (pad, kind).
 ///
 /// Holds the slot lock for the whole call so two threads cannot race two
-/// workers onto one pad. Spawning only waits on the worker's startup ack
+/// workers onto one pad. Starting only waits on the worker's startup ack
 /// (`CreateEventW`), which never touches the slot.
-fn subscribe_or_spawn<N, F>(
-    slot: &Mutex<Weak<NotificationHub<N>>>,
+fn subscribe_or_spawn<N, H, F>(
+    slot: &Mutex<Weak<H>>,
     buffer: NotificationBuffer,
     start: F,
 ) -> Result<NotificationReceiver<N>, ClientError>
 where
     N: Clone + Send + 'static,
-    F: FnOnce(Arc<Fanout<N>>) -> Result<NotificationWorkerHandle, BusError>,
+    H: SharedFanout<N>,
+    F: FnOnce(Arc<Fanout<N>>) -> Result<H, BusError>,
 {
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(hub) = guard.upgrade()
-        && let Some((id, rx)) = hub.fanout.subscribe(buffer)
+        && let Some((id, rx)) = hub.fanout().subscribe(buffer)
     {
         return Ok(NotificationReceiver {
-            _sub: SubscriberToken::new(Arc::clone(&hub.fanout), id),
-            _hub: Arc::clone(&hub),
+            _sub: SubscriberToken::new(Arc::clone(hub.fanout()), id),
+            _hub: hub,
             rx,
         });
     }
@@ -915,8 +919,7 @@ where
     let (id, rx) = fanout
         .subscribe(buffer)
         .expect("fresh fanout must accept subscribers");
-    let worker = start(Arc::clone(&fanout))?;
-    let hub = Arc::new(NotificationHub::new(Arc::clone(&fanout), worker));
+    let hub = Arc::new(start(Arc::clone(&fanout))?);
     *guard = Arc::downgrade(&hub);
     Ok(NotificationReceiver {
         _sub: SubscriberToken::new(fanout, id),
@@ -1009,7 +1012,8 @@ impl TargetHandle<Xbox360, Ready> {
         let serial = self.inner.serial_no;
         let alive = Arc::clone(&self.inner.alive);
         subscribe_or_spawn(&self.inner.notifications.x360, buffer, move |fanout| {
-            bus.start_x360_notification_thread(serial, alive, fanout)
+            bus.start_x360_notification_thread(serial, alive, Arc::clone(&fanout))
+                .map(|worker| NotificationHub::new(fanout, worker))
         })
     }
 
@@ -1058,9 +1062,8 @@ impl TargetHandle<DualShock4, Ready> {
     /// output report, use
     /// [`register_notification_raw_buffer`](Self::register_notification_raw_buffer).
     ///
-    /// **Note:** `register_notification` and `register_notification_raw_buffer`
-    /// are separate streams. Prefer one kind per pad. Using both at once may
-    /// split host output between them depending on the driver version.
+    /// The two kinds are independent driver streams; you can subscribe to both
+    /// on one pad.
     ///
     /// # Errors
     ///
@@ -1104,7 +1107,8 @@ impl TargetHandle<DualShock4, Ready> {
         let serial = self.inner.serial_no;
         let alive = Arc::clone(&self.inner.alive);
         subscribe_or_spawn(&self.inner.notifications.ds4, buffer, move |fanout| {
-            bus.start_ds4_notification_thread(serial, alive, fanout)
+            bus.start_ds4_notification_thread(serial, alive, Arc::clone(&fanout))
+                .map(|worker| NotificationHub::new(fanout, worker))
         })
     }
 
@@ -1114,8 +1118,15 @@ impl TargetHandle<DualShock4, Ready> {
     /// prefer [`register_notification`](Self::register_notification). Delivery
     /// stops when the last receiver is dropped or this pad is unplugged.
     ///
-    /// See [`register_notification`](Self::register_notification) for the note
-    /// about using both kinds on one pad.
+    /// Each receiver gets only **this pad's** reports. The driver delivers raw
+    /// output for every DS4 pad on the bus through one shared queue, stamped with
+    /// the originating pad's serial; the crate runs one listener per [`Client`]
+    /// and routes each report to the pad it names. Reports for other pads,
+    /// including pads owned by other processes, are discarded.
+    ///
+    /// Because the driver queue is bus-wide, other processes that listen for raw
+    /// DS4 output can also observe this pad's output reports. That is a driver
+    /// property, not something this crate can prevent.
     ///
     /// # Errors
     ///
@@ -1144,7 +1155,8 @@ impl TargetHandle<DualShock4, Ready> {
         let serial = self.inner.serial_no;
         let alive = Arc::clone(&self.inner.alive);
         subscribe_or_spawn(&self.inner.notifications.ds4_raw, buffer, move |fanout| {
-            bus.start_ds4_output_thread(serial, alive, fanout)
+            bus.add_ds4_output_route(serial, alive, Arc::clone(&fanout))
+                .map(|router| Ds4OutputRoute::new(fanout, serial, router))
         })
     }
 
@@ -1608,7 +1620,7 @@ mod tests {
             size_of::<Ds4Slots>(),
             size_of::<(
                 Mutex<Weak<NotificationHub<Ds4Notification>>>,
-                Mutex<Weak<NotificationHub<Ds4OutputBuffer>>>,
+                Mutex<Weak<Ds4OutputRoute>>,
             )>()
         );
         assert!(

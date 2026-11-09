@@ -71,6 +71,22 @@ impl<N: Clone> Fanout<N> {
     }
 }
 
+/// Per-pad shared subscription point stored in a pad's notification slot.
+///
+/// The unwind-safety bounds keep `NotificationReceiver` `UnwindSafe` /
+/// `RefUnwindSafe`, as it was in 0.2.0.
+pub(crate) trait SharedFanout<N>:
+    Send + Sync + std::panic::RefUnwindSafe + std::panic::UnwindSafe + 'static
+{
+    fn fanout(&self) -> &Arc<Fanout<N>>;
+}
+
+impl<N: Send + 'static> SharedFanout<N> for NotificationHub<N> {
+    fn fanout(&self) -> &Arc<Fanout<N>> {
+        &self.fanout
+    }
+}
+
 /// Shared worker + fan-out for one (pad, kind).
 ///
 /// `worker` is in a `Mutex` so this type is `Sync` (`JoinHandle` is not).

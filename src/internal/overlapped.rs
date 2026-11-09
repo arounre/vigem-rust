@@ -52,16 +52,22 @@ pub(crate) struct BusInner {
     /// (NUL-terminated UTF-16). `None` if it could not be read - serial
     /// discovery then degrades to [`crate::SerialDiscovery::Off`].
     pub(crate) devnode_id: Option<Vec<u16>>,
+    /// The one DS4 await-output router for this file handle (the driver queues
+    /// that IOCTL per file object, not per pad).
+    #[cfg(feature = "ds4")]
+    pub(crate) ds4_output_router:
+        std::sync::Mutex<std::sync::Weak<crate::internal::ds4_output_router::Ds4OutputRouter>>,
 }
 
 impl BusInner {
-    /// Test helper: no captured instance id.
-    #[cfg(test)]
+    /// No captured instance id.
     #[inline]
     pub(crate) fn new(handle: HANDLE) -> Self {
         Self {
             handle,
             devnode_id: None,
+            #[cfg(feature = "ds4")]
+            ds4_output_router: std::sync::Mutex::new(std::sync::Weak::new()),
         }
     }
 }

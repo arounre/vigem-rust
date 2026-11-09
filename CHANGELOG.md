@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- **DS4 raw output reports went to the wrong pad.** `register_notification_raw_buffer` ran one
+  `IOCTL_DS4_AWAIT_OUTPUT_AVAILABLE` listener per pad and assumed every completion was its own.
+  The driver ignores the serial in that request and hands each output report, from any DS4 pad on
+  the bus, to one pending request per bus handle, stamped with the originating serial. With two
+  subscribed DS4 pads on one `Client`, a report for one could arrive on the other's receiver and
+  never on its own; with another process running a DS4 pad, that pad's reports showed up on yours.
+  Now one listener per `Client` routes each report by its serial, matching upstream ViGEmClient.
+  Reports for other pads and other processes are discarded. No API change. The typed
+  `register_notification` stream was not affected.
+- Removed the docs claim that using `register_notification` and `register_notification_raw_buffer`
+  on one pad "may split host output between them".
+
 ## [0.2.0]
 
 ### In short

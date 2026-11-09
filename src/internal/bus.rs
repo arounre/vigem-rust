@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
+#[cfg(feature = "ds4")]
+use crate::internal::ds4_output_router::{Ds4OutputRouter, RouterCore};
 use crate::internal::notification_hub::Fanout;
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -188,6 +190,52 @@ impl Drop for NotificationWorkerHandle {
     }
 }
 
+/// Where a notification worker sends results, and when it should stop.
+pub(crate) trait NotificationSink<N>: Send + Sync + 'static {
+    /// Hand over one completion. `false` => nobody is listening; stop.
+    fn deliver(&self, item: Result<N, BusError>) -> bool;
+    /// `true` => stop and cancel the in-flight IRP. Called before every
+    /// re-arm and at least every [`WAIT_POLL_MS`] while waiting; may do
+    /// housekeeping. Called under the worker's slot lock: never take a lock
+    /// here that is held while dropping a [`NotificationWorkerHandle`].
+    fn should_stop(&self) -> bool;
+    /// Worker exited: disconnect every receiver.
+    fn close(&self);
+}
+
+impl<N, S: NotificationSink<N> + ?Sized> NotificationSink<N> for Arc<S> {
+    fn deliver(&self, item: Result<N, BusError>) -> bool {
+        (**self).deliver(item)
+    }
+    fn should_stop(&self) -> bool {
+        (**self).should_stop()
+    }
+    fn close(&self) {
+        (**self).close();
+    }
+}
+
+/// One pad, one kind: deliver to its fan-out; stop when the pad dies.
+///
+/// `alive` is the target's shared liveness flag, cleared under the client
+/// mutex on unplug, so the worker never re-arms against a recycled serial.
+pub(crate) struct PadSink<N> {
+    pub(crate) fanout: Arc<Fanout<N>>,
+    pub(crate) alive: Arc<AtomicBool>,
+}
+
+impl<N: Clone + Send + 'static> NotificationSink<N> for PadSink<N> {
+    fn deliver(&self, item: Result<N, BusError>) -> bool {
+        self.fanout.deliver(item)
+    }
+    fn should_stop(&self) -> bool {
+        !self.alive.load(Ordering::Acquire)
+    }
+    fn close(&self) {
+        self.fanout.close();
+    }
+}
+
 /// Older drivers may not implement `IOCTL_VIGEM_WAIT_DEVICE_READY`.
 fn is_optional_wait_device_ready_error(err: &windows::core::Error) -> bool {
     let code = err.code();
@@ -334,10 +382,7 @@ impl Bus {
             };
 
             // Wrap immediately so the version-check IOCTL can hold Arc like every other call.
-            let mut candidate = Arc::new(BusInner {
-                handle,
-                devnode_id: None,
-            });
+            let mut candidate = Arc::new(BusInner::new(handle));
 
             let version = CheckVersion {
                 size: wire_size_of::<CheckVersion>(),
@@ -552,17 +597,19 @@ impl Bus {
         Ok(())
     }
 
-    /// Spawn a notification worker. Pair with a [`Fanout`].
+    /// Spawn a notification worker delivering into `sink`.
     ///
-    /// `alive` is the target's shared liveness flag. Cleared under the client
-    /// mutex on unplug; the worker treats that like shutdown so it never
-    /// re-arms an IOCTL against a recycled serial.
-    pub(crate) fn spawn_notification_thread<W: NotificationWorker>(
+    /// `serial_no` goes into the request and error context; `None` sends
+    /// serial `0` (bus-wide requests) and reports errors without a serial.
+    pub(crate) fn spawn_notification_thread<W, S>(
         &self,
-        serial_no: u32,
-        alive: Arc<AtomicBool>,
-        fanout: Arc<Fanout<W::Notification>>,
-    ) -> Result<NotificationWorkerHandle, BusError> {
+        serial_no: Option<u32>,
+        sink: S,
+    ) -> Result<NotificationWorkerHandle, BusError>
+    where
+        W: NotificationWorker,
+        S: NotificationSink<W::Notification>,
+    {
         let bus = Arc::clone(&self.inner);
         let state = Arc::new(WorkerState {
             slot: Mutex::new(WorkerSlot {
@@ -576,13 +623,13 @@ impl Bus {
         let (sync_tx, sync_rx) = mpsc::channel::<Result<(), BusError>>();
 
         let join = std::thread::spawn(move || {
-            let serial = Some(serial_no);
+            let serial = serial_no;
             let op = W::OPERATION;
 
             // Fail fast before acknowledging startup so the spawner sees CreateEventW errors.
             let mut io = match IoctlBuffers::new(
                 Arc::clone(&bus),
-                Box::new(W::create_request(serial_no)),
+                Box::new(W::create_request(serial_no.unwrap_or(0))),
                 Box::default(),
             ) {
                 Ok(io) => io,
@@ -600,8 +647,7 @@ impl Bus {
 
             let mut consecutive_failures: u32 = 0;
 
-            let should_stop =
-                |state: &WorkerState| lock_slot(state).shutdown || !alive.load(Ordering::Acquire);
+            let should_stop = |state: &WorkerState| lock_slot(state).shutdown || sink.should_stop();
 
             loop {
                 if should_stop(&state_thread) {
@@ -613,7 +659,7 @@ impl Bus {
                 // GetOverlappedResult fails while Internal is still STATUS_PENDING;
                 // zeroing the shared `response` box in that state is a write-race.
                 if let Err(e) = io.call().reset() {
-                    let _ = fanout.deliver(Err(BusError::from_ioctl(op, serial, e)));
+                    let _ = sink.deliver(Err(BusError::from_ioctl(op, serial, e)));
                     break;
                 }
 
@@ -622,7 +668,7 @@ impl Bus {
 
                 let submit = {
                     let mut slot = lock_slot(&state_thread);
-                    if slot.shutdown || !alive.load(Ordering::Acquire) {
+                    if slot.shutdown || sink.should_stop() {
                         break;
                     }
 
@@ -659,7 +705,7 @@ impl Bus {
                 let stop = {
                     let mut slot = lock_slot(&state_thread);
                     slot.overlapped = None;
-                    slot.shutdown || !alive.load(Ordering::Acquire)
+                    slot.shutdown || sink.should_stop()
                 };
 
                 if stop {
@@ -670,7 +716,7 @@ impl Bus {
                     Ok(_) => {
                         consecutive_failures = 0;
                         let notification = W::process_response(io.response());
-                        if !fanout.deliver(Ok(notification)) {
+                        if !sink.deliver(Ok(notification)) {
                             break;
                         }
                     }
@@ -685,13 +731,13 @@ impl Bus {
                         }
 
                         if is_fatal_notification_error(&bus_err) {
-                            let _ = fanout.deliver(Err(bus_err));
+                            let _ = sink.deliver(Err(bus_err));
                             break;
                         }
 
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         if consecutive_failures >= NOTIFICATION_MAX_CONSECUTIVE_FAILURES {
-                            let _ = fanout.deliver(Err(bus_err));
+                            let _ = sink.deliver(Err(bus_err));
                             break;
                         }
                     }
@@ -702,7 +748,7 @@ impl Bus {
 
             let _ = io.finish();
             // Every receiver sees `Disconnected` once the worker exits.
-            fanout.close();
+            sink.close();
         });
 
         match sync_rx.recv() {
@@ -720,7 +766,7 @@ impl Bus {
                 // Keep as unclassified Ioctl (not a driver HRESULT).
                 Err(BusError::Ioctl {
                     operation: W::OPERATION,
-                    serial_no: Some(serial_no),
+                    serial_no,
                     source: Win32Error::from_hresult(windows::Win32::Foundation::E_FAIL.0),
                 })
             }
@@ -734,7 +780,10 @@ impl Bus {
         alive: Arc<AtomicBool>,
         fanout: Arc<Fanout<X360Notification>>,
     ) -> Result<NotificationWorkerHandle, BusError> {
-        self.spawn_notification_thread::<X360NotificationWorker>(serial_no, alive, fanout)
+        self.spawn_notification_thread::<X360NotificationWorker, _>(
+            Some(serial_no),
+            PadSink { fanout, alive },
+        )
     }
 
     #[cfg(feature = "ds4")]
@@ -744,17 +793,47 @@ impl Bus {
         alive: Arc<AtomicBool>,
         fanout: Arc<Fanout<Ds4Notification>>,
     ) -> Result<NotificationWorkerHandle, BusError> {
-        self.spawn_notification_thread::<Ds4NotificationWorker>(serial_no, alive, fanout)
+        self.spawn_notification_thread::<Ds4NotificationWorker, _>(
+            Some(serial_no),
+            PadSink { fanout, alive },
+        )
     }
 
+    /// Route this handle's DS4 raw output for `serial_no` into `fanout`,
+    /// starting the bus-wide await-output worker if none is running.
+    ///
+    /// The returned router must be kept alive for as long as the route is
+    /// wanted (see `Ds4OutputRoute`).
     #[cfg(feature = "ds4")]
-    pub(crate) fn start_ds4_output_thread(
+    pub(crate) fn add_ds4_output_route(
         &self,
         serial_no: u32,
         alive: Arc<AtomicBool>,
         fanout: Arc<Fanout<Ds4OutputBuffer>>,
-    ) -> Result<NotificationWorkerHandle, BusError> {
-        self.spawn_notification_thread::<Ds4OutputWorker>(serial_no, alive, fanout)
+    ) -> Result<Arc<Ds4OutputRouter>, BusError> {
+        // Held across "upgrade or create" so two threads cannot start two routers.
+        let mut slot = self
+            .inner
+            .ds4_output_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if let Some(router) = slot.upgrade()
+            && router.add_route(serial_no, Arc::clone(&alive), Arc::clone(&fanout))
+        {
+            return Ok(router);
+        }
+
+        // None running, or the old one is shutting down: start fresh with this
+        // route already in place so the worker never sees an empty table.
+        let core = Arc::new(RouterCore::default());
+        let inserted = core.insert(serial_no, alive, fanout);
+        debug_assert!(inserted, "fresh router core must accept a route");
+        let worker =
+            self.spawn_notification_thread::<Ds4OutputWorker, _>(None, Arc::clone(&core))?;
+        let router = Arc::new(Ds4OutputRouter::new(core, worker));
+        *slot = Arc::downgrade(&router);
+        Ok(router)
     }
 
     #[cfg(feature = "x360")]

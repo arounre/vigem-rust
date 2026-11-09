@@ -228,6 +228,79 @@ fn two_receivers_share_one_worker() {
     x360.unplug().expect("unplug");
 }
 
+/// DS4 raw output is one bus-wide listener per client, routed by serial.
+///
+/// Two raw-subscribed pads share one worker (the second pad's registration opens
+/// no new process handles). Unplugging one pad disconnects only its receivers;
+/// the other pad's receiver stays connected and the shared worker keeps running.
+///
+/// Does not provoke real host output (that needs a HID write from the test); the
+/// routing itself is covered by unit tests in `internal::ds4_output_router`.
+#[test]
+#[ignore = "requires ViGEmBus driver"]
+#[cfg(feature = "ds4")]
+fn ds4_raw_output_shares_one_router_and_unplug_is_per_pad() {
+    use std::time::{Duration, Instant};
+
+    use vigem_rust::RecvTimeoutError;
+
+    use common::process_handle_count;
+
+    let _guard = driver_lock();
+    let client = Client::connect().expect("ViGEmBus must be installed for this test");
+    let plug = || {
+        client
+            .new_ds4_target()
+            .plug()
+            .expect("plugin")
+            .wait_for_ready()
+            .expect("ready")
+    };
+    let pad_a = plug();
+    let pad_b = plug();
+    // Third pad, never subscribed: its output must not reach anyone.
+    let pad_c = plug();
+
+    let before = process_handle_count();
+    let rx_a = pad_a
+        .register_notification_raw_buffer()
+        .expect("register a");
+    let after_a = process_handle_count();
+    let rx_b = pad_b
+        .register_notification_raw_buffer()
+        .expect("register b");
+    let after_b = process_handle_count();
+    assert!(
+        after_a > before,
+        "first raw registration should start the router worker (event handle)"
+    );
+    assert_eq!(
+        after_b, after_a,
+        "second pad's raw registration must join the existing router, not start a worker"
+    );
+
+    pad_a.unplug().expect("unplug a");
+
+    let deadline = Duration::from_secs(2);
+    let start = Instant::now();
+    loop {
+        match rx_a.recv_timeout(Duration::from_millis(100)) {
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) | Ok(_) if start.elapsed() < deadline => continue,
+            other => panic!("rx_a did not disconnect within {deadline:?} of unplug: {other:?}"),
+        }
+    }
+
+    match rx_b.recv_timeout(Duration::from_millis(500)) {
+        Err(RecvTimeoutError::Timeout) | Ok(_) => {}
+        other => panic!("pad b's raw receiver must survive pad a's unplug, got {other:?}"),
+    }
+
+    drop(rx_b);
+    pad_b.unplug().expect("unplug b");
+    pad_c.unplug().expect("unplug c");
+}
+
 /// DS4 basic + extended submit and both notification workers must arm without
 /// an immediate fatal wire-size / MIN_TRANSFER failure (closes the DS4 live gap).
 #[test]
