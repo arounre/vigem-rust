@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{BusError, ClientError, Operation};
-use crate::internal::bus::Bus;
+use crate::internal::bus::{Bus, PlugReadiness};
 #[cfg(feature = "ds4")]
 use crate::target::DualShock4;
 #[cfg(feature = "x360")]
@@ -744,7 +744,7 @@ impl Client {
         mut plug: F,
     ) -> Result<TargetHandle<T, Pending>, ClientError>
     where
-        F: FnMut(&Bus, &Target, u32) -> Result<(), BusError>,
+        F: FnMut(&Bus, &Target, u32) -> Result<PlugReadiness, BusError>,
     {
         let mut last_retryable: Option<BusError> = None;
         // Serials whose plug attempt failed retryably. Kept in `inner.reserved` so
@@ -842,7 +842,7 @@ impl Client {
             };
 
             match plug(&bus, &target, serial_no) {
-                Ok(()) => {
+                Ok(readiness) => {
                     let mut unplug_guard = UnplugOnDrop {
                         bus: bus.clone(),
                         serial_no,
@@ -889,6 +889,7 @@ impl Client {
                         alive,
                         bus,
                         Arc::downgrade(&self.inner),
+                        readiness,
                     ));
                 }
                 Err(e) if is_retryable_plug_error(&e) => {
@@ -1183,7 +1184,9 @@ mod tests {
         {
             let client = test_client(4);
             let handle = client
-                .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| Ok(()))
+                .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| {
+                    Ok(PlugReadiness::Confirmed)
+                })
                 .expect("plug");
             let serial = handle.serial_no();
 
@@ -1219,10 +1222,9 @@ mod tests {
             let handle = {
                 use crate::target::Xbox360;
                 client
-                    .plugin_internal_with::<Xbox360, _>(
-                        test_spec(),
-                        |_bus, _target, _serial| Ok(()),
-                    )
+                    .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _target, _serial| {
+                        Ok(PlugReadiness::Confirmed)
+                    })
                     .expect("plug")
                     .assume_ready()
             };
@@ -1231,7 +1233,7 @@ mod tests {
                 use crate::target::DualShock4;
                 client
                     .plugin_internal_with::<DualShock4, _>(test_spec(), |_bus, _target, _serial| {
-                        Ok(())
+                        Ok(PlugReadiness::Confirmed)
                     })
                     .expect("plug")
                     .assume_ready()
@@ -1275,11 +1277,15 @@ mod tests {
         let (h1, h2) = {
             use crate::target::Xbox360;
             let h1 = client
-                .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _t, _s| Ok(()))
+                .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _t, _s| {
+                    Ok(PlugReadiness::Confirmed)
+                })
                 .expect("plug 1")
                 .assume_ready();
             let h2 = client
-                .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _t, _s| Ok(()))
+                .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _t, _s| {
+                    Ok(PlugReadiness::Confirmed)
+                })
                 .expect("plug 2")
                 .assume_ready();
             (h1, h2)
@@ -1288,11 +1294,15 @@ mod tests {
         let (h1, h2) = {
             use crate::target::DualShock4;
             let h1 = client
-                .plugin_internal_with::<DualShock4, _>(test_spec(), |_bus, _t, _s| Ok(()))
+                .plugin_internal_with::<DualShock4, _>(test_spec(), |_bus, _t, _s| {
+                    Ok(PlugReadiness::Confirmed)
+                })
                 .expect("plug 1")
                 .assume_ready();
             let h2 = client
-                .plugin_internal_with::<DualShock4, _>(test_spec(), |_bus, _t, _s| Ok(()))
+                .plugin_internal_with::<DualShock4, _>(test_spec(), |_bus, _t, _s| {
+                    Ok(PlugReadiness::Confirmed)
+                })
                 .expect("plug 2")
                 .assume_ready();
             (h1, h2)
@@ -1333,7 +1343,9 @@ mod tests {
         }
 
         let _again = client
-            .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _t, _s| Ok(()))
+            .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _t, _s| {
+                Ok(PlugReadiness::Confirmed)
+            })
             .expect("plug after unplug_all");
         assert_eq!(client.target_count(), 1);
     }
@@ -1391,7 +1403,7 @@ mod tests {
                     c.plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| {
                         // Widen the unlocked plug window so a missing reservation races.
                         std::thread::sleep(std::time::Duration::from_millis(2));
-                        Ok(())
+                        Ok(PlugReadiness::Confirmed)
                     })
                 })
             })
@@ -1442,7 +1454,7 @@ mod tests {
                     };
                     Err(ioctl_err(Operation::PLUGIN_TARGET, code))
                 } else {
-                    Ok(())
+                    Ok(PlugReadiness::Confirmed)
                 }
             })
             .expect("serial 4 should plug");
@@ -1540,7 +1552,7 @@ mod tests {
         let a = client
             .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _t, serial| {
                 assert_eq!(serial, SERIAL, "discovery mask must force serial {SERIAL}");
-                Ok(())
+                Ok(PlugReadiness::Confirmed)
             })
             .expect("plugin A")
             .assume_ready();
@@ -1558,7 +1570,7 @@ mod tests {
         let b = client
             .plugin_internal_with::<Xbox360, _>(test_spec(), |_bus, _t, serial| {
                 assert_eq!(serial, SERIAL, "masked window must recycle serial {SERIAL}");
-                Ok(())
+                Ok(PlugReadiness::Confirmed)
             })
             .expect("plugin B on recycled serial")
             .assume_ready();
@@ -1592,7 +1604,9 @@ mod tests {
     fn quota_blocks_before_any_ioctl() {
         let client = test_client(1);
         let first = client
-            .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| Ok(()))
+            .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| {
+                Ok(PlugReadiness::Confirmed)
+            })
             .expect("first pad");
 
         let result =
@@ -1623,7 +1637,7 @@ mod tests {
                 c.plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| {
                     // Widen the race window between quota check and map insert.
                     thread::sleep(Duration::from_millis(1));
-                    Ok(())
+                    Ok(PlugReadiness::Confirmed)
                 })
             }));
         }
@@ -1712,13 +1726,13 @@ mod tests {
         let a = client
             .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _t, serial| {
                 attempts.push(serial);
-                Ok(())
+                Ok(PlugReadiness::Confirmed)
             })
             .expect("plug A");
         let b = client
             .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _t, serial| {
                 attempts.push(serial);
-                Ok(())
+                Ok(PlugReadiness::Confirmed)
             })
             .expect("plug B");
 
@@ -1750,7 +1764,9 @@ mod tests {
             client.set_serial_discovery(SerialDiscovery::Auto);
             client.set_test_discovery_snapshot([1u32, 2, 3].into_iter().collect());
             let _ = client
-                .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _t, _s| Ok(()))
+                .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _t, _s| {
+                    Ok(PlugReadiness::Confirmed)
+                })
                 .expect("plug");
             assert_eq!(
                 client.discovery_walk_count(),
@@ -1778,7 +1794,7 @@ mod tests {
                             source: Win32Error::from_win32(87),
                         })
                     } else {
-                        Ok(())
+                        Ok(PlugReadiness::Confirmed)
                     }
                 })
                 .expect("plug");
@@ -1813,7 +1829,7 @@ mod tests {
                         (1..=SERIAL_SCAN_LIMIT).contains(&serial),
                         "serial out of window: {serial}"
                     );
-                    Ok(())
+                    Ok(PlugReadiness::Confirmed)
                 })
                 .expect("plug must succeed after discovery bypass");
             assert_eq!(
@@ -1852,7 +1868,7 @@ mod tests {
                             source: Win32Error::from_win32(87),
                         })
                     } else {
-                        Ok(())
+                        Ok(PlugReadiness::Confirmed)
                     }
                 })
                 .expect("plug after bypass");
@@ -1935,6 +1951,7 @@ mod tests {
             Arc::clone(&alive),
             bus,
             Arc::downgrade(&client_inner),
+            PlugReadiness::Confirmed,
         );
 
         let poison_result = catch_unwind(AssertUnwindSafe(|| {

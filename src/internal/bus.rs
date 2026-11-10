@@ -236,6 +236,17 @@ impl<N: Clone + Send + 'static> NotificationSink<N> for PadSink<N> {
     }
 }
 
+/// What [`Bus::plug`] learned about the host having started the new pad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlugReadiness {
+    /// `IOCTL_VIGEM_WAIT_DEVICE_READY` succeeded: the driver saw the host's
+    /// start-up traffic (LED packet for XUSB, report-descriptor fetch for DS4).
+    Confirmed,
+    /// The driver gave no answer (the wait IOCTL is not implemented), so
+    /// `wait_for_ready` has to find out itself.
+    Unknown,
+}
+
 /// Older drivers may not implement `IOCTL_VIGEM_WAIT_DEVICE_READY`.
 fn is_optional_wait_device_ready_error(err: &windows::core::Error) -> bool {
     let code = err.code();
@@ -432,7 +443,11 @@ impl Bus {
 
     /// Plugin + best-effort wait-ready. Missing wait-ready on older drivers is non-fatal.
     /// Callers still use `wait_for_ready` (submit probe); this does not re-issue wait.
-    pub(crate) fn plug(&self, target: &Target, serial_no: u32) -> Result<(), BusError> {
+    /// Plug `target` at `serial_no`, then ask the driver to wait for the host.
+    ///
+    /// Returns whether the driver confirmed the host has started the pad
+    /// (see [`PlugReadiness`]).
+    pub(crate) fn plug(&self, target: &Target, serial_no: u32) -> Result<PlugReadiness, BusError> {
         let plugin = PluginTarget {
             size: wire_size_of::<PluginTarget>(),
             serial_no,
@@ -472,8 +487,8 @@ impl Bus {
         };
 
         match wait_result {
-            Ok(_) => Ok(()),
-            Err(e) if is_optional_wait_device_ready_error(&e) => Ok(()),
+            Ok(_) => Ok(PlugReadiness::Confirmed),
+            Err(e) if is_optional_wait_device_ready_error(&e) => Ok(PlugReadiness::Unknown),
             Err(e) => {
                 let _ = self.unplug(serial_no);
                 Err(BusError::from_ioctl(

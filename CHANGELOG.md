@@ -17,6 +17,18 @@ All notable changes to this project are documented here. The format is based on
   Now one listener per `Client` routes each report by its serial, matching upstream ViGEmClient.
   Reports for other pads and other processes are discarded. No API change. The typed
   `register_notification` stream was not affected.
+- **Xbox 360 `wait_for_ready` did not check anything.** It sent all-zero reports and waited for
+  three to succeed, but the driver accepts an unchanged report without touching the device, and a
+  new pad's last report is all zeroes. So the check always passed. On drivers that implement
+  `WAIT_DEVICE_READY` this did no harm, because `plug` had already waited for the host. On drivers
+  that don't, you got a `Ready` handle with no evidence the host had seen the pad. Now `plug`
+  records whether the driver confirmed readiness. If it did, `wait_for_ready` returns at once. If
+  not, it polls the pad's XInput user index, which the driver only reports after the host's first
+  LED packet, and times out with `ReadyTimeout` otherwise. (On ViGEmBus 1.21.442 an assigned index
+  comes back as `ERROR_INSUFFICIENT_BUFFER` with the value lost; the wait counts that as assigned.)
+  It no longer sends any reports. On an
+  older driver, a fifth or later Xbox 360 pad may never get an index; use `assume_ready` for those.
+  DualShock 4 readiness is unchanged.
 - Removed the docs claim that using `register_notification` and `register_notification_raw_buffer`
   on one pad "may split host output between them".
 

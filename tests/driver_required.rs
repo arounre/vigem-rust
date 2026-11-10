@@ -76,14 +76,15 @@ fn wait_for_ready_completes_under_1s() {
         x360.unplug().expect("unplug");
     }
 
-    // Zero-timeout wait succeeds when plug already waited (modern drivers).
+    // Zero-timeout wait succeeds when plug already waited (modern drivers):
+    // either the driver confirmed readiness, or one user-index poll succeeds.
     let pending = client
         .new_x360_target()
         .plug()
         .expect("plugin should succeed");
     let ready = pending
         .wait_for_ready_timeout(Duration::ZERO)
-        .expect("already-ready pad should pass a single zero-timeout probe");
+        .expect("already-ready pad should pass a zero-timeout wait");
     ready.unplug().expect("unplug");
 }
 

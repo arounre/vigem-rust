@@ -73,7 +73,7 @@ Client::connect()
 
 `update` and `register_notification` only exist after you promote a `Pending` handle.
 
-- `wait_for_ready` sends neutral reports until a short streak succeeds (3 s default;
+- `wait_for_ready` waits until the host has started the pad (3 s default;
   `wait_for_ready_timeout` to change). It takes `&self`, so a timeout does not unplug.
   Keep the pending handle to retry, or call `assume_ready`.
 - `assume_ready` skips the probe. Early reports may be no-ops.

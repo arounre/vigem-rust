@@ -54,15 +54,76 @@ use crate::{
     error::{BusError, ClientError, Operation, RecvError, RecvTimeoutError, TryRecvError},
     internal::{
         bounded_channel::{self, BoundedReceiver},
-        bus::Bus,
+        bus::{Bus, PlugReadiness},
         notification_hub::{Fanout, NotificationHub, SharedFanout, SubscriberToken},
         overlapped::OverlappedCall,
     },
 };
 
+#[cfg_attr(not(feature = "ds4"), allow(dead_code))]
 #[inline]
 fn is_retryable_ready_error(err: &ClientError) -> bool {
     matches!(err, ClientError::Bus(BusError::TargetNotReady { .. }))
+}
+
+/// Win32 form of `STATUS_INVALID_DEVICE_OBJECT_PARAMETER`.
+///
+/// `IOCTL_XUSB_GET_USER_INDEX` fails with it until the host has sent the pad
+/// an LED packet that assigns XInput slot 0..=3.
+#[cfg(feature = "x360")]
+const ERROR_INVALID_DEVICE_OBJECT_PARAMETER: u32 = 650;
+
+/// Win32 form of `STATUS_BUFFER_TOO_SMALL`.
+///
+/// Measured on ViGEmBus 1.21.442: once the pad has a slot, the driver's
+/// `GetUserIndex` succeeds, but the request still reaches user mode as this
+/// error and the index value is lost. (`ViGEmClient` ignores this error and
+/// reports index 0.) For readiness only the fact matters, so treat it as "assigned".
+#[cfg(feature = "x360")]
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+/// Does `err` carry `code` from `XUSB_GET_USER_INDEX`?
+#[cfg(feature = "x360")]
+#[inline]
+fn is_user_index_code(err: &ClientError, code: u32) -> bool {
+    matches!(
+        err,
+        ClientError::Bus(BusError::Ioctl { operation, source, .. })
+            if *operation == Operation::XUSB_GET_USER_INDEX && source.win32_code() == Some(code)
+    )
+}
+
+/// The Xbox 360 user-index query failed only because the pad is still coming up:
+///
+/// - `ERROR_INVALID_DEVICE_OBJECT_PARAMETER`: the host has not assigned a slot yet.
+/// - `DeviceGone`: for about the first millisecond after `PLUGIN_TARGET` the
+///   driver does not know the serial yet. Without `WAIT_DEVICE_READY`, `plug`
+///   returns inside that window. The wait checks this client's own liveness
+///   flag every round, so a real unplug still ends it.
+///
+/// Every other failure (access denied, unclassified IOCTL errors, ...) is a
+/// hard error for `wait_for_ready`.
+#[cfg(feature = "x360")]
+#[inline]
+fn is_user_index_pending(err: &ClientError) -> bool {
+    is_user_index_code(err, ERROR_INVALID_DEVICE_OBJECT_PARAMETER)
+        || matches!(
+            err,
+            ClientError::Bus(BusError::DeviceGone { operation, .. })
+                if *operation == Operation::XUSB_GET_USER_INDEX
+        )
+}
+
+/// Map a user-index query result to a readiness probe result.
+///
+/// `ERROR_INSUFFICIENT_BUFFER` means "assigned" (see [`ERROR_INSUFFICIENT_BUFFER`]).
+#[cfg(feature = "x360")]
+fn user_index_probe(result: Result<u32, BusError>) -> Result<(), ClientError> {
+    match result.map_err(ClientError::from) {
+        Ok(_) => Ok(()),
+        Err(e) if is_user_index_code(&e, ERROR_INSUFFICIENT_BUFFER) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Default queue size for rumble / LED (and similar) notifications (currently `4`).
@@ -131,8 +192,9 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Neutral submits in a row before minting [`Ready`].
+/// Neutral DS4 submits in a row before minting [`Ready`].
 /// One success can still be followed by [`BusError::TargetNotReady`] under multi-plug.
+#[cfg_attr(not(feature = "ds4"), allow(dead_code))]
 const READY_CONSECUTIVE_PROBES: u32 = 3;
 
 /// Marker type: the pad is plugged, but not yet ready for input.
@@ -148,8 +210,9 @@ pub struct Pending;
 /// This is the default type parameter on [`TargetHandle`], so
 /// `TargetHandle<Xbox360>` means a ready pad.
 ///
-/// Readiness is not permanent. `wait_for_ready` only checks that a few neutral
-/// reports were accepted. If you plug many pads at once, a later `update` can
+/// Readiness is not permanent. `wait_for_ready` checks that the host has started
+/// the pad (Xbox 360) or that a few neutral reports were accepted (DualShock 4);
+/// it says nothing about later reports. If you plug many pads at once, a later `update` can
 /// still return [`BusError::TargetNotReady`] briefly. Treat that as retryable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ready;
@@ -300,6 +363,11 @@ struct TargetHandleInner<T: Device> {
     ///
     /// Mutex: cloned handles share this call; Windows allows one IRP per event.
     submit: Mutex<Option<OverlappedCall>>,
+    /// `true` once something has shown the host started this pad: the driver's
+    /// `WAIT_DEVICE_READY` at plug ([`PlugReadiness::Confirmed`]), or a later
+    /// successful Xbox 360 user-index poll. Never goes back to `false`.
+    #[cfg_attr(not(feature = "x360"), allow(dead_code))]
+    ready_confirmed: AtomicBool,
     notifications: <T as sealed::DeviceSlots>::Slots,
 }
 
@@ -407,6 +475,7 @@ impl<T: Device, S> TargetHandle<T, S> {
         alive: Arc<AtomicBool>,
         bus: Bus,
         client_inner: Weak<Mutex<ClientInner>>,
+        readiness: PlugReadiness,
     ) -> Self {
         Self {
             inner: Arc::new(TargetHandleInner {
@@ -416,6 +485,7 @@ impl<T: Device, S> TargetHandle<T, S> {
                 bus,
                 client_inner,
                 submit: Mutex::new(None),
+                ready_confirmed: AtomicBool::new(readiness == PlugReadiness::Confirmed),
                 notifications: Default::default(),
             }),
             _state: PhantomData,
@@ -542,8 +612,8 @@ impl<T: Device> TargetHandle<T, Pending> {
     ///
     /// | Call | Blocks | Guarantee |
     /// |---|---|---|
-    /// | [`wait_for_ready`](TargetHandle::wait_for_ready) | up to ~3 s | pad accepted several reports in a row |
-    /// | `wait_for_ready_timeout(Duration::ZERO)` | one quick check | pad accepted one report |
+    /// | [`wait_for_ready`](TargetHandle::wait_for_ready) | up to ~3 s | Xbox 360: host has started the pad (confirmed by the driver at plug, or the pad has an XInput user index). DS4: pad accepted several neutral reports in a row |
+    /// | `wait_for_ready_timeout(Duration::ZERO)` | one quick check | Xbox 360: same check, polled once. DS4: pad accepted one report |
     /// | `assume_ready` | no | none; early `update`s may be ignored |
     #[must_use]
     pub fn assume_ready(self) -> TargetHandle<T, Ready> {
@@ -566,33 +636,49 @@ impl<T: Device> TargetHandle<T, Pending> {
         }
     }
 
-    /// Retry `probe` until it succeeds enough times, or the wait gives up.
+    /// Submit-probe wait: retry `probe` until it succeeds enough times in a row.
     ///
     /// `timeout == 0` is one probe: `Ok` -> Ready, `TargetNotReady` ->
     /// [`ClientError::ReadyTimeout`]. Non-zero needs [`READY_CONSECUTIVE_PROBES`]
-    /// consecutive `Ok`s; any `TargetNotReady` resets the streak. The deadline
-    /// is checked only after a retryable error (`checked_add` overflow = no
-    /// deadline). Successes do not sleep. The first miss is retried immediately;
-    /// later misses back off by [`READY_POLL_INTERVAL`].
-    ///
-    /// Takes `&self` so a timeout does not drop this handle (and therefore does
-    /// not unplug the pad). Success returns a `Ready` clone of the same identity.
+    /// consecutive `Ok`s; any `TargetNotReady` resets the streak. See
+    /// [`Self::poll_until_ready`] for deadline and back-off rules.
     ///
     /// `probe` receives `&self` so it can reuse the per-handle cached
     /// [`OverlappedCall`] (via [`Self::with_submit_call`]) instead of
     /// `CreateEventW` on every poll.
+    #[cfg_attr(not(feature = "ds4"), allow(dead_code))]
     fn wait_with_probe(
         &self,
         timeout: Duration,
-        mut probe: impl FnMut(&Self) -> Result<(), ClientError>,
+        probe: impl FnMut(&Self) -> Result<(), ClientError>,
     ) -> Result<TargetHandle<T, Ready>, ClientError> {
-        self.assert_live()?;
-
         let need = if timeout.is_zero() {
             1
         } else {
             READY_CONSECUTIVE_PROBES
         };
+        self.poll_until_ready(timeout, need, is_retryable_ready_error, probe)
+    }
+
+    /// Retry `probe` until it succeeds `need` times in a row, or the wait gives up.
+    ///
+    /// Errors for which `is_retryable` is true reset the streak and are retried;
+    /// any other error is returned as-is. `timeout == 0` is one probe, and a
+    /// retryable error on it is [`ClientError::ReadyTimeout`]. The deadline is
+    /// checked only after a retryable error (`checked_add` overflow = no
+    /// deadline). Successes do not sleep. The first miss is retried immediately;
+    /// later misses back off by [`READY_POLL_INTERVAL`].
+    ///
+    /// Takes `&self` so a timeout does not drop this handle (and therefore does
+    /// not unplug the pad). Success returns a `Ready` clone of the same identity.
+    fn poll_until_ready(
+        &self,
+        timeout: Duration,
+        need: u32,
+        is_retryable: fn(&ClientError) -> bool,
+        mut probe: impl FnMut(&Self) -> Result<(), ClientError>,
+    ) -> Result<TargetHandle<T, Ready>, ClientError> {
+        self.assert_live()?;
 
         // First probe before the deadline. Zero-timeout returns here (`need == 1`).
         let mut consecutive = match probe(self) {
@@ -602,10 +688,10 @@ impl<T: Device> TargetHandle<T, Pending> {
                 }
                 1u32
             }
-            Err(e) if timeout.is_zero() && is_retryable_ready_error(&e) => {
+            Err(e) if timeout.is_zero() && is_retryable(&e) => {
                 return Err(ClientError::ReadyTimeout { timeout });
             }
-            Err(e) if is_retryable_ready_error(&e) => 0u32,
+            Err(e) if is_retryable(&e) => 0u32,
             Err(e) => return Err(e),
         };
 
@@ -622,14 +708,11 @@ impl<T: Device> TargetHandle<T, Pending> {
                     }
                     // No sleep on success; the happy path is consecutive submits.
                 }
-                Err(e)
-                    if is_retryable_ready_error(&e)
-                        && deadline.is_none_or(|d| Instant::now() < d) =>
-                {
+                Err(e) if is_retryable(&e) && deadline.is_none_or(|d| Instant::now() < d) => {
                     consecutive = 0;
                     thread::sleep(READY_POLL_INTERVAL);
                 }
-                Err(e) if is_retryable_ready_error(&e) => {
+                Err(e) if is_retryable(&e) => {
                     return Err(ClientError::ReadyTimeout { timeout });
                 }
                 Err(e) => return Err(e),
@@ -641,11 +724,23 @@ impl<T: Device> TargetHandle<T, Pending> {
 #[cfg(feature = "x360")]
 #[cfg_attr(docsrs, doc(cfg(feature = "x360")))]
 impl TargetHandle<Xbox360, Pending> {
-    /// Wait until the pad accepts input (default timeout: 3 seconds).
+    /// Wait until the host has started the pad (default timeout: 3 seconds).
     ///
-    /// Sends neutral reports until several succeed in a row, then returns a
-    /// [`Ready`] handle. Call this after `plug` before `update` or
+    /// Returns a [`Ready`] handle. Call this after `plug` before `update` or
     /// `register_notification`.
+    ///
+    /// # What is checked
+    ///
+    /// - **Current ViGEmBus drivers:** `plug` already asked the driver to wait
+    ///   until the host sent the pad its first LED packet. If that succeeded,
+    ///   this only checks the pad is still plugged and returns at once.
+    /// - **Drivers without that wait:** polls the pad's XInput user index every
+    ///   10 ms. The driver reports one only after the host's LED packet, so a
+    ///   success means the host is talking to the pad.
+    ///
+    /// No reports are sent. On an older driver, a pad beyond the fourth XInput
+    /// slot may never get a user index, and this then times out. Use
+    /// [`assume_ready`](Self::assume_ready) in that case.
     ///
     /// Takes `&self`: a timeout does **not** drop this handle or unplug the pad.
     /// Bind the pending handle if you want to retry or call
@@ -653,12 +748,9 @@ impl TargetHandle<Xbox360, Pending> {
     ///
     /// # Errors
     ///
-    /// - [`ClientError::ReadyTimeout`]: timed out while the pad was still warming up
-    /// - [`ClientError::Bus`] / [`ClientError::TargetDoesNotExist`]: hard failures
-    ///
-    /// After success, `update` should work in normal use. If you plug many pads
-    /// at once, a brief [`BusError::TargetNotReady`] on a later `update` is still
-    /// possible. A short retry is fine.
+    /// - [`ClientError::ReadyTimeout`]: the host did not start the pad in time
+    /// - [`ClientError::TargetDoesNotExist`]: the pad was unplugged
+    /// - [`ClientError::Bus`]: any other driver failure
     pub fn wait_for_ready(&self) -> Result<TargetHandle<Xbox360, Ready>, ClientError> {
         self.wait_for_ready_timeout(DEFAULT_READY_TIMEOUT)
     }
@@ -667,8 +759,10 @@ impl TargetHandle<Xbox360, Pending> {
     ///
     /// | `timeout` | Behavior |
     /// |-----------|----------|
-    /// | `> 0` | Wait until several neutral reports succeed in a row, or fail with [`ReadyTimeout`](ClientError::ReadyTimeout) |
-    /// | `0` | One probe only (fast, weaker check) |
+    /// | `> 0` | Poll the user index until the host assigns one, or fail with [`ReadyTimeout`](ClientError::ReadyTimeout) |
+    /// | `0` | One poll only |
+    ///
+    /// If the driver already confirmed readiness at plug, both return at once.
     ///
     /// Takes `&self`; see [`wait_for_ready`](Self::wait_for_ready) for recovery.
     ///
@@ -679,14 +773,28 @@ impl TargetHandle<Xbox360, Pending> {
         &self,
         timeout: Duration,
     ) -> Result<TargetHandle<Xbox360, Ready>, ClientError> {
-        let report = X360Report::default();
-        self.wait_with_probe(timeout, |this| {
-            this.with_submit_call(|call| {
-                this.inner
-                    .bus
-                    .update_x360_on(call, this.inner.serial_no, &report)
-            })
+        self.wait_x360_with(timeout, |this| {
+            user_index_probe(this.inner.bus.get_x360_user_index(this.inner.serial_no))
         })
+    }
+
+    /// [`Self::wait_for_ready_timeout`] with an injectable user-index probe.
+    ///
+    /// Confirmed at plug (or by an earlier wait): liveness check only.
+    /// Otherwise poll until one success; only [`is_user_index_pending`] errors
+    /// are retried. A success is remembered for every clone of this pad.
+    fn wait_x360_with(
+        &self,
+        timeout: Duration,
+        probe: impl FnMut(&Self) -> Result<(), ClientError>,
+    ) -> Result<TargetHandle<Xbox360, Ready>, ClientError> {
+        if self.inner.ready_confirmed.load(Ordering::Acquire) {
+            self.assert_live()?;
+            return Ok(self.as_ready());
+        }
+        let ready = self.poll_until_ready(timeout, 1, is_user_index_pending, probe)?;
+        self.inner.ready_confirmed.store(true, Ordering::Release);
+        Ok(ready)
     }
 }
 
@@ -695,9 +803,10 @@ impl TargetHandle<Xbox360, Pending> {
 impl TargetHandle<DualShock4, Pending> {
     /// Wait until the pad accepts input (default timeout: 3 seconds).
     ///
-    /// Same contract as the Xbox 360
-    /// [`wait_for_ready`](TargetHandle::wait_for_ready): probe with neutral
-    /// [`Ds4Report`]s. DS4 often rejects input briefly after plug.
+    /// Sends neutral [`Ds4Report`]s until several succeed in a row, then
+    /// returns a [`Ready`] handle. DS4 often rejects input briefly after plug.
+    /// (The Xbox 360 wait checks the host instead; see
+    /// [`wait_for_ready`](TargetHandle::wait_for_ready).)
     ///
     /// Takes `&self`: a timeout does **not** drop this handle or unplug the pad.
     ///
@@ -1355,7 +1464,9 @@ mod tests {
 
     fn pending_pad(client: &Client) -> TargetHandle<TestPad, Pending> {
         client
-            .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| Ok(()))
+            .plugin_internal_with::<TestPad, _>(test_spec(), |_bus, _target, _serial| {
+                Ok(PlugReadiness::Confirmed)
+            })
             .expect("plug")
     }
 
@@ -1572,6 +1683,227 @@ mod tests {
         assert!(matches!(handle.is_attached(), Ok(false)));
     }
 
+    #[cfg(feature = "x360")]
+    fn x360_pending(client: &Client, readiness: PlugReadiness) -> TargetHandle<Xbox360, Pending> {
+        client
+            .plugin_internal_with::<Xbox360, _>(test_spec(), move |_, _, _| Ok(readiness))
+            .expect("plug")
+    }
+
+    /// What `XUSB_GET_USER_INDEX` returns before the host assigns a slot.
+    #[cfg(feature = "x360")]
+    fn user_index_pending(serial_no: u32) -> ClientError {
+        ClientError::Bus(BusError::classify_ioctl(
+            Operation::XUSB_GET_USER_INDEX,
+            Some(serial_no),
+            crate::error::Win32Error::from_win32(ERROR_INVALID_DEVICE_OBJECT_PARAMETER),
+        ))
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
+    fn x360_confirmed_at_plug_skips_probe() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Confirmed);
+
+        for timeout in [Duration::ZERO, Duration::from_secs(1)] {
+            let ready = handle
+                .wait_x360_with(timeout, |_| panic!("confirmed pad must not be probed"))
+                .expect("ready");
+            assert_eq!(ready.serial_no(), handle.serial_no());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
+    fn x360_confirmed_but_unplugged_is_target_does_not_exist() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Confirmed);
+        let serial = handle.serial_no();
+        // Null test bus fails the IOCTL, but the pad is detached either way.
+        let _ = handle.unplug();
+        assert!(matches!(handle.is_attached(), Ok(false)));
+
+        let err = handle
+            .wait_x360_with(Duration::from_secs(1), |_| panic!("must not probe"))
+            .expect_err("unplugged pad must not become Ready");
+        assert!(
+            matches!(err, ClientError::TargetDoesNotExist { serial_no } if serial_no == serial),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
+    fn x360_unknown_polls_user_index_until_assigned_then_remembers() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Unknown);
+        let serial = handle.serial_no();
+        let probes = RefCell::new(0u32);
+
+        let ready = handle
+            .wait_x360_with(Duration::from_secs(1), |_| {
+                *probes.borrow_mut() += 1;
+                if *probes.borrow() < 3 {
+                    Err(user_index_pending(serial))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("ready once the index is assigned");
+        assert_eq!(*probes.borrow(), 3, "one success is enough");
+        drop(ready);
+
+        // A clone shares the flag: later waits do not poll again.
+        let clone = handle.clone();
+        clone
+            .wait_x360_with(Duration::ZERO, |_| {
+                panic!("confirmed pad must not be probed")
+            })
+            .expect("still ready");
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
+    fn x360_unknown_times_out_as_ready_timeout() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Unknown);
+        let serial = handle.serial_no();
+        let timeout = Duration::from_millis(50);
+        let probes = RefCell::new(0u32);
+
+        let started = Instant::now();
+        let err = handle
+            .wait_x360_with(timeout, |_| {
+                *probes.borrow_mut() += 1;
+                Err(user_index_pending(serial))
+            })
+            .expect_err("never assigned -> timeout");
+        assert!(
+            matches!(err, ClientError::ReadyTimeout { timeout: t } if t == timeout),
+            "got {err:?}"
+        );
+        assert!(started.elapsed() >= timeout);
+        assert!(*probes.borrow() >= 2);
+        assert!(handle.is_attached().expect("client live"));
+
+        // A timeout must not mark the pad confirmed.
+        let probes_before = *probes.borrow();
+        let _ = handle.wait_x360_with(Duration::ZERO, |_| {
+            *probes.borrow_mut() += 1;
+            Err(user_index_pending(serial))
+        });
+        assert_eq!(*probes.borrow(), probes_before + 1);
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
+    fn x360_unknown_only_pending_index_is_retryable() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Unknown);
+        let serial = handle.serial_no();
+
+        let hard_errors = [
+            ClientError::Bus(BusError::AccessDenied {
+                operation: Operation::XUSB_GET_USER_INDEX,
+                serial_no: Some(serial),
+            }),
+            // DeviceGone from another operation is not the post-plug window.
+            ClientError::Bus(BusError::DeviceGone {
+                operation: Operation::XUSB_SUBMIT_REPORT,
+                serial_no: Some(serial),
+            }),
+            // Submit-path status: not part of the user-index wait.
+            ClientError::Bus(BusError::TargetNotReady { serial_no: serial }),
+            // Same Win32 code from a different operation is not "index pending".
+            ClientError::Bus(BusError::classify_ioctl(
+                Operation::XUSB_SUBMIT_REPORT,
+                Some(serial),
+                crate::error::Win32Error::from_win32(ERROR_INVALID_DEVICE_OBJECT_PARAMETER),
+            )),
+        ];
+
+        for hard in hard_errors {
+            let expected = format!("{hard:?}");
+            let probes = RefCell::new(0u32);
+            let mut once = Some(hard);
+            let err = handle
+                .wait_x360_with(Duration::from_secs(1), |_| {
+                    *probes.borrow_mut() += 1;
+                    Err(once.take().expect("hard error must not be retried"))
+                })
+                .expect_err("hard error propagates");
+            assert_eq!(format!("{err:?}"), expected);
+            assert_eq!(*probes.borrow(), 1);
+        }
+        assert!(handle.is_attached().expect("client live"));
+    }
+
+    /// Sequence measured on ViGEmBus 1.21.442 right after `PLUGIN_TARGET`:
+    /// `DeviceGone` (serial not known yet) -> 650 (no slot) -> 122 (assigned).
+    #[test]
+    #[cfg(feature = "x360")]
+    fn x360_unknown_follows_measured_driver_sequence() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Unknown);
+        let serial = handle.serial_no();
+        let ioctl = |code| {
+            BusError::classify_ioctl(
+                Operation::XUSB_GET_USER_INDEX,
+                Some(serial),
+                crate::error::Win32Error::from_win32(code),
+            )
+        };
+        let script = RefCell::new(
+            [
+                Err(BusError::DeviceGone {
+                    operation: Operation::XUSB_GET_USER_INDEX,
+                    serial_no: Some(serial),
+                }),
+                Err(ioctl(ERROR_INVALID_DEVICE_OBJECT_PARAMETER)),
+                Err(ioctl(ERROR_INSUFFICIENT_BUFFER)),
+            ]
+            .into_iter(),
+        );
+
+        handle
+            .wait_x360_with(Duration::from_secs(1), |_| {
+                user_index_probe(script.borrow_mut().next().expect("script exhausted"))
+            })
+            .expect("122 means the index is assigned");
+        assert!(script.borrow_mut().next().is_none(), "all three probed");
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
+    fn user_index_probe_mapping() {
+        let ioctl = |op, code| {
+            BusError::classify_ioctl(op, Some(1), crate::error::Win32Error::from_win32(code))
+        };
+        assert!(user_index_probe(Ok(2)).is_ok());
+        assert!(
+            user_index_probe(Err(ioctl(
+                Operation::XUSB_GET_USER_INDEX,
+                ERROR_INSUFFICIENT_BUFFER
+            )))
+            .is_ok()
+        );
+        let pending = user_index_probe(Err(ioctl(
+            Operation::XUSB_GET_USER_INDEX,
+            ERROR_INVALID_DEVICE_OBJECT_PARAMETER,
+        )))
+        .expect_err("650 is not ready");
+        assert!(is_user_index_pending(&pending));
+        // 122 from another operation is not mapped.
+        assert!(
+            user_index_probe(Err(ioctl(
+                Operation::XUSB_SUBMIT_REPORT,
+                ERROR_INSUFFICIENT_BUFFER
+            )))
+            .is_err()
+        );
+    }
+
     const fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
@@ -1634,7 +1966,7 @@ mod tests {
     fn reregister_after_worker_closed_fanout_spawns_new_hub() {
         let client = Client::null_for_tests(4);
         let pad = client
-            .plugin_internal_with::<Xbox360, _>(test_spec(), |_, _, _| Ok(()))
+            .plugin_internal_with::<Xbox360, _>(test_spec(), |_, _, _| Ok(PlugReadiness::Confirmed))
             .expect("plug")
             .assume_ready();
 
@@ -1677,7 +2009,7 @@ mod tests {
     fn notification_receiver_exposes_configured_buffer() {
         let client = Client::null_for_tests(4);
         let pad = client
-            .plugin_internal_with::<Xbox360, _>(test_spec(), |_, _, _| Ok(()))
+            .plugin_internal_with::<Xbox360, _>(test_spec(), |_, _, _| Ok(PlugReadiness::Confirmed))
             .expect("plug")
             .assume_ready();
 
