@@ -28,7 +28,19 @@ All notable changes to this project are documented here. The format is based on
   comes back as `ERROR_INSUFFICIENT_BUFFER` with the value lost; the wait counts that as assigned.)
   It no longer sends any reports. On an
   older driver, a fifth or later Xbox 360 pad may never get an index; use `assume_ready` for those.
-  DualShock 4 readiness is unchanged.
+- **DualShock 4 `wait_for_ready` could time out on a ready pad.** It needed three neutral reports
+  accepted back to back. Each accepted report uses up one read the host has waiting, so a host that
+  kept fewer than three reads queued (a slow or busy machine) could reject the third, reset the
+  count, and repeat until `ReadyTimeout`. Now one accepted report is enough: the driver accepts a
+  report only when the host has a read waiting, so one success already shows the host is reading
+  from the pad. Not seen on ViGEmBus 1.21.442 in testing (the host always kept up), but nothing
+  relied on the extra two successes.
+- **The docs described `TargetNotReady` as a plug-time condition.** They said it happens "right
+  after plug" or "when plugging several pads at once", which suggests it stops once the pad is up.
+  It doesn't: ViGEmBus drops any report that arrives when the host has no read waiting, at any
+  time, and nothing resends it. Ignoring the error on a button release leaves the button stuck. The
+  docs (`BusError::TargetNotReady`, `Ready`, the `update` methods, README) now say the report was
+  not delivered, when to send it again, and show a short resend loop. No behaviour change.
 - Removed the docs claim that using `register_notification` and `register_notification_raw_buffer`
   on one pad "may split host output between them".
 

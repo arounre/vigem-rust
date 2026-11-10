@@ -216,14 +216,15 @@ fn soak_update_handles() {
 /// Cap printed error lines so a death spiral does not flood the console.
 const MAX_LOGGED_ERRORS: usize = 64;
 
-/// Brief post-ready blips under multi-plug load (see test docs).
+/// Resends of a report the driver dropped (`TargetNotReady`: host had no read
+/// waiting). Can happen on any submit, not only after plug; see test docs.
 const READY_RETRY_ATTEMPTS: u32 = 16;
 const READY_RETRY_SLEEP: Duration = Duration::from_millis(2);
 
 struct Counters {
     update_ok: AtomicU64,
     update_err: AtomicU64,
-    /// Recovered `TargetNotReady` (not a hard failure).
+    /// Dropped reports that a resend then delivered (not a hard failure).
     not_ready_retries: AtomicU64,
     churn_ok: AtomicU64,
     churn_err: AtomicU64,
@@ -269,7 +270,8 @@ fn is_target_not_ready(err: &ClientError) -> bool {
     matches!(err, ClientError::Bus(BusError::TargetNotReady { .. }))
 }
 
-/// `update` with short retries on transient `TargetNotReady` (multi-plug race).
+/// `update` that resends on `TargetNotReady` (report dropped because the host
+/// had no read waiting), the way a caller should for a report that must arrive.
 fn update_resilient(
     pad: &TargetHandle<Xbox360>,
     report: &X360Report,
@@ -300,9 +302,11 @@ fn update_resilient(
 /// - live peak handle growth <= baseline + 4 + 2xpads + 16
 /// - pagefile growth after warm sample <= 16 MiB
 ///
-/// Note: under concurrent multi-plug, ViGEm can return `TargetNotReady` on the
-/// first submit even right after `wait_for_ready`. Updates retry that briefly;
-/// only persistent failures count against PASS.
+/// Note: any submit can return `TargetNotReady` if the host has no read waiting
+/// for that pad at that moment (the driver drops the report). It is most likely
+/// right after plug, and more likely here with many pads and threads, but
+/// `wait_for_ready` does not rule it out. Updates resend briefly; only
+/// persistent failures count against PASS.
 #[test]
 #[ignore = "requires ViGEmBus; long-running"]
 fn multi_pad_chaos() {

@@ -192,11 +192,6 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Neutral DS4 submits in a row before minting [`Ready`].
-/// One success can still be followed by [`BusError::TargetNotReady`] under multi-plug.
-#[cfg_attr(not(feature = "ds4"), allow(dead_code))]
-const READY_CONSECUTIVE_PROBES: u32 = 3;
-
 /// Marker type: the pad is plugged, but not yet ready for input.
 ///
 /// Returned by [`plug`](TargetBuilder::plug). Call
@@ -210,10 +205,11 @@ pub struct Pending;
 /// This is the default type parameter on [`TargetHandle`], so
 /// `TargetHandle<Xbox360>` means a ready pad.
 ///
-/// Readiness is not permanent. `wait_for_ready` checks that the host has started
-/// the pad (Xbox 360) or that a few neutral reports were accepted (DualShock 4);
-/// it says nothing about later reports. If you plug many pads at once, a later `update` can
-/// still return [`BusError::TargetNotReady`] briefly. Treat that as retryable.
+/// `Ready` does not mean every later report is delivered. `wait_for_ready`
+/// checks that the host has started the pad (Xbox 360) or has accepted a
+/// neutral report (DualShock 4). Any later `update` can still return
+/// [`BusError::TargetNotReady`], which means that report was dropped; see the
+/// variant docs for when to send it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ready;
 
@@ -612,8 +608,8 @@ impl<T: Device> TargetHandle<T, Pending> {
     ///
     /// | Call | Blocks | Guarantee |
     /// |---|---|---|
-    /// | [`wait_for_ready`](TargetHandle::wait_for_ready) | up to ~3 s | Xbox 360: host has started the pad (confirmed by the driver at plug, or the pad has an XInput user index). DS4: pad accepted several neutral reports in a row |
-    /// | `wait_for_ready_timeout(Duration::ZERO)` | one quick check | Xbox 360: same check, polled once. DS4: pad accepted one report |
+    /// | [`wait_for_ready`](TargetHandle::wait_for_ready) | up to ~3 s | Xbox 360: host has started the pad (confirmed by the driver at plug, or the pad has an XInput user index). DS4: the host accepted a neutral report |
+    /// | `wait_for_ready_timeout(Duration::ZERO)` | one quick check | Xbox 360: same check, polled once. DS4: same check, sent once |
     /// | `assume_ready` | no | none; early `update`s may be ignored |
     #[must_use]
     pub fn assume_ready(self) -> TargetHandle<T, Ready> {
@@ -636,12 +632,18 @@ impl<T: Device> TargetHandle<T, Pending> {
         }
     }
 
-    /// Submit-probe wait: retry `probe` until it succeeds enough times in a row.
+    /// Submit-probe wait: retry `probe` until one submit is accepted.
     ///
     /// `timeout == 0` is one probe: `Ok` -> Ready, `TargetNotReady` ->
-    /// [`ClientError::ReadyTimeout`]. Non-zero needs [`READY_CONSECUTIVE_PROBES`]
-    /// consecutive `Ok`s; any `TargetNotReady` resets the streak. See
-    /// [`Self::poll_until_ready`] for deadline and back-off rules.
+    /// [`ClientError::ReadyTimeout`]. See [`Self::poll_until_ready`] for
+    /// deadline and back-off rules.
+    ///
+    /// One success is enough. An accepted submit means the host had a read
+    /// pending, so it is reading from the pad. Earlier versions required 3 in a
+    /// row; each one uses up a pending host read, so on a slow or loaded host
+    /// that streak could reset on a ready pad. The 0.2.1 measurement (ViGEmBus
+    /// 1.21.442, one pad, test `ds4_probe_sequence_after_plug`) never saw a
+    /// reset, but the streak protected nothing the caller can rely on.
     ///
     /// `probe` receives `&self` so it can reuse the per-handle cached
     /// [`OverlappedCall`] (via [`Self::with_submit_call`]) instead of
@@ -652,48 +654,36 @@ impl<T: Device> TargetHandle<T, Pending> {
         timeout: Duration,
         probe: impl FnMut(&Self) -> Result<(), ClientError>,
     ) -> Result<TargetHandle<T, Ready>, ClientError> {
-        let need = if timeout.is_zero() {
-            1
-        } else {
-            READY_CONSECUTIVE_PROBES
-        };
-        self.poll_until_ready(timeout, need, is_retryable_ready_error, probe)
+        self.poll_until_ready(timeout, is_retryable_ready_error, probe)
     }
 
-    /// Retry `probe` until it succeeds `need` times in a row, or the wait gives up.
+    /// Retry `probe` until it succeeds once, or the wait gives up.
     ///
-    /// Errors for which `is_retryable` is true reset the streak and are retried;
-    /// any other error is returned as-is. `timeout == 0` is one probe, and a
-    /// retryable error on it is [`ClientError::ReadyTimeout`]. The deadline is
-    /// checked only after a retryable error (`checked_add` overflow = no
-    /// deadline). Successes do not sleep. The first miss is retried immediately;
-    /// later misses back off by [`READY_POLL_INTERVAL`].
+    /// Errors for which `is_retryable` is true are retried; any other error is
+    /// returned as-is. `timeout == 0` is one probe, and a retryable error on it
+    /// is [`ClientError::ReadyTimeout`]. The deadline is checked only after a
+    /// retryable error (`checked_add` overflow = no deadline). The first miss is
+    /// retried immediately; later misses back off by [`READY_POLL_INTERVAL`].
     ///
     /// Takes `&self` so a timeout does not drop this handle (and therefore does
     /// not unplug the pad). Success returns a `Ready` clone of the same identity.
     fn poll_until_ready(
         &self,
         timeout: Duration,
-        need: u32,
         is_retryable: fn(&ClientError) -> bool,
         mut probe: impl FnMut(&Self) -> Result<(), ClientError>,
     ) -> Result<TargetHandle<T, Ready>, ClientError> {
         self.assert_live()?;
 
-        // First probe before the deadline. Zero-timeout returns here (`need == 1`).
-        let mut consecutive = match probe(self) {
-            Ok(()) => {
-                if need == 1 {
-                    return Ok(self.as_ready());
-                }
-                1u32
-            }
+        // First probe before the deadline. Zero-timeout returns here.
+        match probe(self) {
+            Ok(()) => return Ok(self.as_ready()),
             Err(e) if timeout.is_zero() && is_retryable(&e) => {
                 return Err(ClientError::ReadyTimeout { timeout });
             }
-            Err(e) if is_retryable(&e) => 0u32,
+            Err(e) if is_retryable(&e) => {}
             Err(e) => return Err(e),
-        };
+        }
 
         // Overflow (near `Duration::MAX`) means no deadline, same as
         // `mpsc::Receiver::recv_timeout`.
@@ -701,15 +691,8 @@ impl<T: Device> TargetHandle<T, Pending> {
         loop {
             self.assert_live()?;
             match probe(self) {
-                Ok(()) => {
-                    consecutive = consecutive.saturating_add(1);
-                    if consecutive >= need {
-                        return Ok(self.as_ready());
-                    }
-                    // No sleep on success; the happy path is consecutive submits.
-                }
+                Ok(()) => return Ok(self.as_ready()),
                 Err(e) if is_retryable(&e) && deadline.is_none_or(|d| Instant::now() < d) => {
-                    consecutive = 0;
                     thread::sleep(READY_POLL_INTERVAL);
                 }
                 Err(e) if is_retryable(&e) => {
@@ -792,7 +775,7 @@ impl TargetHandle<Xbox360, Pending> {
             self.assert_live()?;
             return Ok(self.as_ready());
         }
-        let ready = self.poll_until_ready(timeout, 1, is_user_index_pending, probe)?;
+        let ready = self.poll_until_ready(timeout, is_user_index_pending, probe)?;
         self.inner.ready_confirmed.store(true, Ordering::Release);
         Ok(ready)
     }
@@ -803,10 +786,12 @@ impl TargetHandle<Xbox360, Pending> {
 impl TargetHandle<DualShock4, Pending> {
     /// Wait until the pad accepts input (default timeout: 3 seconds).
     ///
-    /// Sends neutral [`Ds4Report`]s until several succeed in a row, then
-    /// returns a [`Ready`] handle. DS4 often rejects input briefly after plug.
-    /// (The Xbox 360 wait checks the host instead; see
-    /// [`wait_for_ready`](TargetHandle::wait_for_ready).)
+    /// Sends neutral [`Ds4Report`]s until the driver accepts one, then returns
+    /// a [`Ready`] handle. The driver accepts a report only when the host has a
+    /// read waiting for the pad, so this means the host is reading from it.
+    /// Right after plug the host has usually not started yet, so the first
+    /// reports are rejected for a few milliseconds. (The Xbox 360 wait sends no
+    /// reports; see [`wait_for_ready`](TargetHandle::wait_for_ready).)
     ///
     /// Takes `&self`: a timeout does **not** drop this handle or unplug the pad.
     ///
@@ -820,9 +805,10 @@ impl TargetHandle<DualShock4, Pending> {
 
     /// Same as [`wait_for_ready`](Self::wait_for_ready), with your own timeout.
     ///
-    /// `timeout == 0` is a single probe. Non-zero waits for several successes in a
-    /// row. After success, a brief [`BusError::TargetNotReady`] on a later `update`
-    /// is still possible when plugging many pads at once.
+    /// `timeout == 0` sends one report. Non-zero retries until one is accepted.
+    /// A later `update` can still return [`BusError::TargetNotReady`] if the
+    /// host has no read waiting at that moment; that report was not delivered
+    /// (see [`Ready`]).
     ///
     /// Takes `&self`; see [`wait_for_ready`](Self::wait_for_ready) for recovery.
     ///
@@ -1134,8 +1120,8 @@ impl TargetHandle<Xbox360, Ready> {
     /// # Errors
     ///
     /// - [`ClientError::TargetDoesNotExist`]: this pad was unplugged
-    /// - [`ClientError::Bus`]: driver failure; [`BusError::TargetNotReady`] is
-    ///   transient and worth a short retry
+    /// - [`ClientError::Bus`]: driver failure; [`BusError::TargetNotReady`] means this
+    ///   report was dropped and not delivered; send it again if it must arrive
     ///
     /// # Example
     /// ```no_run
@@ -1277,8 +1263,8 @@ impl TargetHandle<DualShock4, Ready> {
     /// # Errors
     ///
     /// - [`ClientError::TargetDoesNotExist`]: this pad was unplugged
-    /// - [`ClientError::Bus`]: driver failure; [`BusError::TargetNotReady`] is
-    ///   transient and worth a short retry
+    /// - [`ClientError::Bus`]: driver failure; [`BusError::TargetNotReady`] means this
+    ///   report was dropped and not delivered; send it again if it must arrive
     ///
     /// # Example
     /// ```no_run
@@ -1316,8 +1302,8 @@ impl TargetHandle<DualShock4, Ready> {
     /// # Errors
     ///
     /// - [`ClientError::TargetDoesNotExist`]: this pad was unplugged
-    /// - [`ClientError::Bus`]: driver failure; [`BusError::TargetNotReady`] is
-    ///   transient and worth a short retry; [`BusError::Ioctl`] if the driver
+    /// - [`ClientError::Bus`]: driver failure; [`BusError::TargetNotReady`] means this
+    ///   report was dropped and not delivered; send it again if it must arrive; [`BusError::Ioctl`] if the driver
     ///   lacks extended-report support
     ///
     /// # Example
@@ -1471,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_streak_requires_three_consecutive_oks() {
+    fn probe_one_success_is_ready() {
         {
             let client = Client::null_for_tests(4);
             let handle = pending_pad(&client);
@@ -1484,27 +1470,22 @@ mod tests {
                 })
                 .expect("ready");
 
-            assert_eq!(*probes.borrow(), READY_CONSECUTIVE_PROBES);
+            assert_eq!(*probes.borrow(), 1, "first accepted submit is enough");
             let _ = ready;
         }
 
-        // NotReady mid-streak resets; need three consecutive OKs after (5 probes total).
+        // Misses before the host starts reading, then one success (the
+        // measured `xxO` shape): ready on the first `Ok`, no further probes.
         {
             let client = Client::null_for_tests(4);
             let handle = pending_pad(&client);
             let serial = handle.serial_no();
-            let script = RefCell::new(
-                [
-                    Ok(()),
-                    Err(ClientError::Bus(BusError::TargetNotReady {
-                        serial_no: serial,
-                    })),
-                    Ok(()),
-                    Ok(()),
-                    Ok(()),
-                ]
-                .into_iter(),
-            );
+            let not_ready = || {
+                Err(ClientError::Bus(BusError::TargetNotReady {
+                    serial_no: serial,
+                }))
+            };
+            let script = RefCell::new([not_ready(), not_ready(), Ok(())].into_iter());
             let probes = RefCell::new(0u32);
 
             let ready = handle
@@ -1513,11 +1494,11 @@ mod tests {
                     script
                         .borrow_mut()
                         .next()
-                        .expect("script exhausted before wait finished")
+                        .expect("probed again after a success")
                 })
-                .expect("ready after streak reset");
+                .expect("ready after early misses");
 
-            assert_eq!(*probes.borrow(), 5);
+            assert_eq!(*probes.borrow(), 3);
             let _ = ready;
         }
     }

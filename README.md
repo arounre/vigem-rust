@@ -77,8 +77,9 @@ Client::connect()
   `wait_for_ready_timeout` to change). It takes `&self`, so a timeout does not unplug.
   Keep the pending handle to retry, or call `assume_ready`.
 - `assume_ready` skips the probe. Early reports may be no-ops.
-- `Ready` is not permanent. When plugging several pads at once, a later `update` can
-  still return `BusError::TargetNotReady`. Treat that as retryable.
+- `Ready` does not mean every report gets through. If the host is not reading, the
+  driver drops the report and `update` returns `BusError::TargetNotReady`. A loop that
+  sends the full state every frame can ignore it; resend a report that must arrive.
 
 ## Sharing and teardown
 
@@ -125,7 +126,7 @@ Match `ClientError` and the nested `BusError`:
 - `VersionMismatch` — driver is not compatible; install a current Nefarius build
   (1.21.442 / 1.22.0)
 - `AccessDenied` — fix permissions
-- `TargetNotReady` — retry shortly
+- `TargetNotReady` — that report was dropped; send it again if it must arrive
 - `BusSerialsExhausted` — the serial window is taken; free pads elsewhere, or retry later
 - `NoFreeSlot` — you hit your own quota (the driver is not contacted); unplug a pad or
   raise `max_targets`

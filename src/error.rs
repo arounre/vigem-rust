@@ -10,7 +10,7 @@
 //! | [`BusError::VersionMismatch`] | Installed ViGEmBus is not compatible | Install a current Nefarius build (1.21.442 / 1.22.0) |
 //! | [`BusError::AccessDenied`] | No permission to open the bus | Run elevated or fix device permissions |
 //! | [`BusError::DeviceGone`] | Driver removed, or pad no longer exists | Drop handles; reconnect if the bus died |
-//! | [`BusError::TargetNotReady`] | Pad still coming up after plug | Retry `update` shortly (or use `wait_for_ready`) |
+//! | [`BusError::TargetNotReady`] | Host had no read waiting; the report was dropped (most often right after plug) | Send that report again if it must arrive; see the variant docs |
 //! | [`ClientError::ReadyTimeout`] | `wait_for_ready` timed out | Call again on the same pending handle, or `assume_ready` |
 //! | [`ClientError::NoFreeSlot`] | This client is at its own `max_targets` | Unplug one of your pads, or connect with a higher `max_targets` |
 //! | [`ClientError::BusSerialsExhausted`] | All scanned serials taken, possibly by other processes | Unplug pads anywhere on the machine, or retry later |
@@ -279,11 +279,50 @@ pub enum BusError {
         serial_no: Option<u32>,
     },
 
-    /// The pad is not accepting input yet (usually right after plug).
+    /// The report was **not delivered**: the host had no read waiting for this pad.
     ///
-    /// Retryable. [`wait_for_ready`](crate::TargetHandle::wait_for_ready) covers
-    /// most of this window; a later `update` after plugging many pads at once
-    /// may still see this briefly.
+    /// ViGEmBus does not queue input reports. It hands each one straight to a
+    /// read the host's input stack has pending, and if none is pending at that
+    /// moment it drops the report and returns this error. This is most likely
+    /// right after plug, before the host starts reading (which
+    /// [`wait_for_ready`](crate::TargetHandle::wait_for_ready) waits out), but it
+    /// can happen at any time if reports arrive faster than the host asks for
+    /// them. Nothing is retried for you.
+    ///
+    /// `Ok` from `update` means the opposite: the report reached the host. (On
+    /// Xbox 360, a report identical to the previous one is accepted without
+    /// being sent again, since the host already has that state.)
+    ///
+    /// What to do depends on the report:
+    ///
+    /// - **A frame loop that sends the full state every frame** can ignore a
+    ///   miss. The next frame carries the same state.
+    /// - **A report that must arrive**, such as a button release or the last
+    ///   report before you stop sending, has to be sent again. Otherwise the
+    ///   host keeps the previous state (a stuck button).
+    ///
+    /// ```
+    /// use std::{thread, time::Duration};
+    /// use vigem_rust::{BusError, ClientError};
+    ///
+    /// /// Resend until the driver accepts the report, for about 50 ms at most.
+    /// fn send_until_delivered(
+    ///     mut send: impl FnMut() -> Result<(), ClientError>,
+    /// ) -> Result<(), ClientError> {
+    ///     let mut tries = 0;
+    ///     loop {
+    ///         match send() {
+    ///             Err(ClientError::Bus(BusError::TargetNotReady { .. })) if tries < 50 => {
+    ///                 tries += 1;
+    ///                 thread::sleep(Duration::from_millis(1));
+    ///             }
+    ///             other => return other,
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// // send_until_delivered(|| pad.update(&release))?;
+    /// ```
     #[error("target {serial_no} is not ready to accept reports")]
     TargetNotReady {
         /// Serial of the pad that rejected the report.

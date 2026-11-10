@@ -88,6 +88,123 @@ fn wait_for_ready_completes_under_1s() {
     ready.unplug().expect("unplug");
 }
 
+/// DS4 `wait_for_ready` on real plugs, then how well the host keeps up (review F3).
+///
+/// Phase 1 replays the `poll_until_ready` policy through public `update` (same
+/// submit path as the probe): first miss retried at once, later misses sleep
+/// 10 ms, done on the first accepted submit, 3 s deadline. It logs the outcome
+/// sequence per plug (`O` = accepted, `x` = `TargetNotReady`). Asserted: no
+/// plug times out.
+///
+/// Phase 2, on the same pad once ready, sends a back-to-back burst and records
+/// how many submits succeed before the first miss. Each accepted submit uses up
+/// one pending host read (review D2), so misses here mean the host fell behind.
+/// Printed only; useful for A2's retry back-off and for rechecking on other
+/// drivers, several pads, or a loaded machine.
+///
+/// 0.2.1, ViGEmBus 1.21.442, one pad, 20 plugs: every plug `xxO` in ~10 ms;
+/// 1000/1000 back-to-back submits accepted on every plug.
+///
+/// Run: `cargo test --features ds4 --test driver_required ds4_probe_sequence -- --ignored --nocapture`
+#[test]
+#[ignore = "requires ViGEmBus driver"]
+#[cfg(feature = "ds4")]
+fn ds4_probe_sequence_after_plug() {
+    use std::time::{Duration, Instant};
+    use vigem_rust::{BusError, ClientError, Ds4Report};
+
+    const PLUGS: usize = 20;
+    const POLL: Duration = Duration::from_millis(10); // READY_POLL_INTERVAL
+    const TIMEOUT: Duration = Duration::from_secs(3); // DEFAULT_READY_TIMEOUT
+    const BURST: usize = 1000;
+
+    fn submit(pad: &vigem_rust::TargetHandle<vigem_rust::DualShock4>) -> bool {
+        match pad.update(&Ds4Report::default()) {
+            Ok(()) => true,
+            Err(ClientError::Bus(BusError::TargetNotReady { .. })) => false,
+            Err(e) => panic!("unexpected update error: {e:?}"),
+        }
+    }
+
+    let _guard = driver_lock();
+    let client = Client::connect().expect("ViGEmBus must be installed for this test");
+
+    let mut sequences = Vec::with_capacity(PLUGS);
+    let mut timed_out = 0usize;
+    let mut elapsed_ms = Vec::with_capacity(PLUGS);
+    let mut burst_first_miss = Vec::with_capacity(PLUGS);
+    let mut burst_misses = Vec::with_capacity(PLUGS);
+    let mut burst_patterns = Vec::with_capacity(PLUGS);
+
+    for _ in 0..PLUGS {
+        let pad = client
+            .new_ds4_target()
+            .plug()
+            .expect("plugin should succeed")
+            .assume_ready();
+
+        // Phase 1: replay of poll_until_ready.
+        let start = Instant::now();
+        let mut seq = String::new();
+        let mut misses = 0u32;
+        let ready = loop {
+            if submit(&pad) {
+                seq.push('O');
+                break true;
+            } else {
+                seq.push('x');
+                misses += 1;
+                if start.elapsed() >= TIMEOUT {
+                    break false;
+                }
+                // First miss retried at once; later misses back off.
+                if misses > 1 {
+                    std::thread::sleep(POLL);
+                }
+            }
+        };
+        elapsed_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        if !ready {
+            timed_out += 1;
+        }
+        // Long sequences: keep head and tail.
+        if seq.len() > 40 {
+            seq = format!("{}…{} (len {})", &seq[..20], &seq[seq.len() - 10..], seq.len());
+        }
+        sequences.push(seq);
+
+        // Phase 2: back-to-back burst on the now-ready pad.
+        let mut pattern = String::with_capacity(BURST);
+        for _ in 0..BURST {
+            pattern.push(if submit(&pad) { 'O' } else { 'x' });
+        }
+        burst_first_miss.push(pattern.find('x').unwrap_or(BURST));
+        burst_misses.push(pattern.matches('x').count());
+        burst_patterns.push(pattern);
+
+        pad.unplug().expect("unplug");
+    }
+
+    eprintln!("ds4 probe replay ({PLUGS} plugs, done on first accepted submit):");
+    for (i, (s, ms)) in sequences.iter().zip(&elapsed_ms).enumerate() {
+        eprintln!("  plug {i:2}: {ms:7.2} ms  {s}");
+    }
+    eprintln!("  timed out: {timed_out}/{PLUGS}");
+    eprintln!("ds4 back-to-back burst of {BURST} after ready:");
+    for (i, p) in burst_patterns.iter().enumerate() {
+        // Only bursts with a miss; show where the misses fall.
+        if let Some(first) = p.find('x') {
+            let end = (first + 60).min(p.len());
+            eprintln!("  plug {i:2}: from {first}: {}", &p[first..end]);
+        }
+    }
+    eprintln!(
+        "  successes before first miss: {burst_first_miss:?}\n  misses per burst: {burst_misses:?}"
+    );
+
+    assert_eq!(timed_out, 0, "probe replay hit ReadyTimeout on a plugged pad");
+}
+
 /// After a bus-level `update` failure, a later `update` on the same handle works.
 #[test]
 #[ignore = "requires ViGEmBus driver"]
