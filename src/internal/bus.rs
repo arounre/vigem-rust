@@ -17,11 +17,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
     SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
 };
-#[cfg(feature = "x360")]
-use windows::Win32::Foundation::ERROR_TIMEOUT;
 use windows::Win32::Foundation::{
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED,
-    GENERIC_READ, GENERIC_WRITE,
+    ERROR_DEVICE_HARDWARE_ERROR, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED, ERROR_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
@@ -90,9 +88,18 @@ const _: () = assert!(DETAIL_DATA_CB_SIZE == 8);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(DETAIL_DATA_CB_SIZE == 6);
 
-/// Access denied wins; else `VersionMismatch` if `CHECK_VERSION` failed for a
-/// non-`INVALID_PARAMETER` reason; else `BusNotFound` (with last error if an
-/// interface was seen).
+/// Whether a `CHECK_VERSION` failure is the driver rejecting our version.
+///
+/// The driver reports a mismatch only as `STATUS_NOT_SUPPORTED`
+/// (`ERROR_NOT_SUPPORTED`); any other failure (timeout, device gone, malformed
+/// request) is not a version problem.
+fn is_version_mismatch(e: Win32Error) -> bool {
+    e.win32_code() == Some(ERROR_NOT_SUPPORTED.0)
+}
+
+/// Access denied wins; else `VersionMismatch` if `CHECK_VERSION` failed with
+/// `ERROR_NOT_SUPPORTED` (see [`is_version_mismatch`]); else `BusNotFound` (with
+/// last error if an interface was seen).
 fn classify_connect_failure(
     saw_interface: bool,
     version_mismatch: bool,
@@ -242,8 +249,9 @@ pub(crate) enum PlugReadiness {
     /// `IOCTL_VIGEM_WAIT_DEVICE_READY` succeeded: the driver saw the host's
     /// start-up traffic (LED packet for XUSB, report-descriptor fetch for DS4).
     Confirmed,
-    /// The driver gave no answer (the wait IOCTL is not implemented), so
-    /// `wait_for_ready` has to find out itself.
+    /// The driver did not confirm it, so `wait_for_ready` has to find out
+    /// itself. Either the wait IOCTL is not implemented, or the driver's own
+    /// 1 s wait for the host ran out (see [`readiness_after_wait_error`]).
     Unknown,
 }
 
@@ -253,6 +261,27 @@ fn is_optional_wait_device_ready_error(err: &windows::core::Error) -> bool {
     code == ERROR_INVALID_PARAMETER.to_hresult()
         || code == ERROR_NOT_SUPPORTED.to_hresult()
         || code == ERROR_INVALID_FUNCTION.to_hresult()
+}
+
+/// ViGEmBus waits at most 1 s for the host to start a new pad, then completes
+/// `WAIT_DEVICE_READY` with `STATUS_DEVICE_HARDWARE_ERROR`
+/// (`ERROR_DEVICE_HARDWARE_ERROR`, 483). The pad still exists and may become
+/// usable once the host catches up (first plug on a machine, loaded system).
+fn is_wait_device_ready_driver_timeout(err: &windows::core::Error) -> bool {
+    err.code() == ERROR_DEVICE_HARDWARE_ERROR.to_hresult()
+}
+
+/// What a failed `WAIT_DEVICE_READY` means for the plug: `Some(Unknown)` keeps
+/// the pad and leaves the decision to `wait_for_ready`; `None` fails the plug.
+fn readiness_after_wait_error(err: &windows::core::Error) -> Option<PlugReadiness> {
+    (is_optional_wait_device_ready_error(err) || is_wait_device_ready_driver_timeout(err))
+        .then_some(PlugReadiness::Unknown)
+}
+
+/// Our own bounded wait in [`OverlappedCall`] gave up (`ERROR_TIMEOUT`). The
+/// driver never reports this code, and the IRP may still have succeeded.
+fn is_local_ioctl_timeout(err: &windows::core::Error) -> bool {
+    err.code() == ERROR_TIMEOUT.to_hresult()
 }
 
 #[inline]
@@ -314,7 +343,7 @@ impl Bus {
             let mut needed: u32 = 0;
             // SAFETY: size probe only; no detail buffer. Failure often means
             // ERROR_INSUFFICIENT_BUFFER with `needed` filled - that is success for us.
-            let _ = unsafe {
+            let probe_result = unsafe {
                 SetupDiGetDeviceInterfaceDetailW(
                     devices,
                     &iface as *const _,
@@ -326,6 +355,11 @@ impl Bus {
             };
 
             if needed == 0 {
+                // No size means the probe really failed; keep why for BusNotFound.
+                // (An `Ok` with zero size should not happen; leave last_error as is.)
+                if let Err(e) = probe_result {
+                    last_error = Some(Win32Error::from(e));
+                }
                 continue;
             }
 
@@ -421,15 +455,12 @@ impl Bus {
                     }
                     return Ok(Bus { inner: candidate });
                 }
-                // ERROR_INVALID_PARAMETER here means a malformed / wrong-size
-                // CheckVersion, not a real version mismatch: leave
-                // `version_mismatch` false so this surfaces as BusNotFound.
-                Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
-                    last_error = Some(Win32Error::from(e));
-                }
                 Err(e) => {
-                    version_mismatch = true;
-                    last_error = Some(Win32Error::from(e));
+                    let e = Win32Error::from(e);
+                    // Only the driver's real mismatch status counts; a timeout or a
+                    // device that vanished mid-connect surfaces as BusNotFound.
+                    version_mismatch |= is_version_mismatch(e);
+                    last_error = Some(e);
                 }
             }
         }
@@ -441,12 +472,16 @@ impl Bus {
         ))
     }
 
-    /// Plugin + best-effort wait-ready. Missing wait-ready on older drivers is non-fatal.
-    /// Callers still use `wait_for_ready` (submit probe); this does not re-issue wait.
     /// Plug `target` at `serial_no`, then ask the driver to wait for the host.
     ///
     /// Returns whether the driver confirmed the host has started the pad
-    /// (see [`PlugReadiness`]).
+    /// (see [`PlugReadiness`]). A missing wait IOCTL or the driver's own 1 s
+    /// wait running out is not fatal: the pad stays plugged as `Unknown`.
+    /// Any other wait failure unplugs the pad and fails.
+    ///
+    /// If `PLUGIN_TARGET` times out locally, the driver may still have created
+    /// the pad, so a best-effort unplug is issued before returning the error.
+    /// The caller holds `serial_no` reserved until this returns.
     pub(crate) fn plug(&self, target: &Target, serial_no: u32) -> Result<PlugReadiness, BusError> {
         let plugin = PluginTarget {
             size: wire_size_of::<PluginTarget>(),
@@ -457,7 +492,7 @@ impl Bus {
         };
 
         // SAFETY: stack-local input; no output.
-        unsafe {
+        let plugin_result = unsafe {
             OverlappedCall::ioctl_sync(
                 &self.inner,
                 IOCTL_VIGEM_PLUGIN_TARGET,
@@ -466,8 +501,20 @@ impl Bus {
                 core::ptr::null_mut(),
                 0,
             )
+        };
+        if let Err(e) = plugin_result {
+            if is_local_ioctl_timeout(&e) {
+                // The call has been cancelled and drained by now; if the driver
+                // created the pad anyway, nobody would own it. Unplug only
+                // touches this handle's pads, and the serial is still ours.
+                let _ = self.unplug(serial_no);
+            }
+            return Err(BusError::from_ioctl(
+                Operation::PLUGIN_TARGET,
+                Some(serial_no),
+                e,
+            ));
         }
-        .map_err(map_ioctl(Operation::PLUGIN_TARGET, Some(serial_no)))?;
 
         let wait_ready = WaitDeviceReady {
             size: wire_size_of::<WaitDeviceReady>(),
@@ -488,8 +535,10 @@ impl Bus {
 
         match wait_result {
             Ok(_) => Ok(PlugReadiness::Confirmed),
-            Err(e) if is_optional_wait_device_ready_error(&e) => Ok(PlugReadiness::Unknown),
             Err(e) => {
+                if let Some(readiness) = readiness_after_wait_error(&e) {
+                    return Ok(readiness);
+                }
                 let _ = self.unplug(serial_no);
                 Err(BusError::from_ioctl(
                     Operation::WAIT_DEVICE_READY,
@@ -637,7 +686,14 @@ impl Bus {
 
         let (sync_tx, sync_rx) = mpsc::channel::<Result<(), BusError>>();
 
-        let join = std::thread::spawn(move || {
+        // Named so the worker is identifiable in debuggers; `Builder::spawn`
+        // returns an error instead of panicking when the OS refuses a thread.
+        let thread_name = match serial_no {
+            Some(n) => format!("vigem-notify-{n}"),
+            None => "vigem-notify-bus".to_owned(),
+        };
+        let builder = std::thread::Builder::new().name(thread_name);
+        let spawn_result = builder.spawn(move || {
             let serial = serial_no;
             let op = W::OPERATION;
 
@@ -765,6 +821,15 @@ impl Bus {
             // Every receiver sees `Disconnected` once the worker exits.
             sink.close();
         });
+
+        let join = spawn_result.map_err(|e| BusError::Ioctl {
+            operation: Operation::from_static("spawn notification worker"),
+            serial_no,
+            source: e.raw_os_error().map_or_else(
+                || Win32Error::from_hresult(windows::Win32::Foundation::E_FAIL.0),
+                |code| Win32Error::from_win32(code as u32),
+            ),
+        })?;
 
         match sync_rx.recv() {
             Ok(Ok(())) => Ok(NotificationWorkerHandle {
@@ -958,6 +1023,44 @@ impl core::iter::FusedIterator for DeviceInterfaceIterator {}
 mod tests {
     use super::*;
 
+    fn win32(code: u32) -> windows::core::Error {
+        windows::core::Error::from(windows::Win32::Foundation::WIN32_ERROR(code))
+    }
+
+    /// F6(a): which `WAIT_DEVICE_READY` failures keep the pad as `Unknown`.
+    #[test]
+    fn wait_device_ready_errors_that_keep_the_pad() {
+        for (code, keep) in [
+            (483, true),   // ERROR_DEVICE_HARDWARE_ERROR: driver's 1 s wait ran out
+            (87, true),    // ERROR_INVALID_PARAMETER: wait IOCTL not implemented
+            (50, true),    // ERROR_NOT_SUPPORTED
+            (1, true),     // ERROR_INVALID_FUNCTION
+            (1460, false), // ERROR_TIMEOUT: our own 5 s wait gave up
+            (55, false),   // ERROR_DEV_NOT_EXIST
+            (5, false),    // ERROR_ACCESS_DENIED
+            (995, false),  // ERROR_OPERATION_ABORTED
+        ] {
+            let expected = keep.then_some(PlugReadiness::Unknown);
+            assert_eq!(
+                readiness_after_wait_error(&win32(code)),
+                expected,
+                "code {code}"
+            );
+        }
+    }
+
+    /// F6(b): only our own wait timeout triggers the cleanup unplug.
+    #[test]
+    fn local_ioctl_timeout_is_error_timeout_only() {
+        assert!(is_local_ioctl_timeout(&windows::core::Error::new(
+            ERROR_TIMEOUT.to_hresult(),
+            "OverlappedCall: IOCTL wait timed out; IRP still pending",
+        )));
+        for code in [87, 183, 5, 55, 483, 995, 121] {
+            assert!(!is_local_ioctl_timeout(&win32(code)), "code {code}");
+        }
+    }
+
     #[test]
     fn fatal_notification_error_is_device_gone_only() {
         let gone = BusError::DeviceGone {
@@ -1047,6 +1150,37 @@ mod tests {
             msg.contains("version mismatch"),
             "VersionMismatch display should mention mismatch, got: {msg}"
         );
+
+        // CHECK_VERSION failures: only ERROR_NOT_SUPPORTED is a version mismatch;
+        // everything else ends up as BusNotFound carrying the real error.
+        for (code, expect_mismatch) in [
+            (50, true),    // ERROR_NOT_SUPPORTED (driver's STATUS_NOT_SUPPORTED)
+            (87, false),   // ERROR_INVALID_PARAMETER
+            (1460, false), // ERROR_TIMEOUT
+            (55, false),   // ERROR_DEV_NOT_EXIST
+            (433, false),  // ERROR_NO_SUCH_DEVICE
+            (1167, false), // ERROR_DEVICE_NOT_CONNECTED
+            (995, false),  // ERROR_OPERATION_ABORTED
+        ] {
+            let e = Win32Error::from_win32(code);
+            assert_eq!(is_version_mismatch(e), expect_mismatch, "code {code}");
+            match classify_connect_failure(true, is_version_mismatch(e), Some(e)) {
+                BusError::VersionMismatch { requested } if expect_mismatch => {
+                    assert_eq!(requested, VIGEM_COMMON_VERSION);
+                }
+                BusError::BusNotFound { source: Some(src) } if !expect_mismatch => {
+                    assert_eq!(src.win32_code(), Some(code));
+                }
+                other => panic!(
+                    "code {code}: expected {}, got {other:?}",
+                    if expect_mismatch {
+                        "VersionMismatch"
+                    } else {
+                        "BusNotFound with source"
+                    }
+                ),
+            }
+        }
     }
 
     /// Live pin: unknown serial classifies as [`BusError::DeviceGone`].

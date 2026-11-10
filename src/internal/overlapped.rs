@@ -8,8 +8,9 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
-    ERROR_OPERATION_ABORTED, ERROR_TIMEOUT, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, E_UNEXPECTED, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
+    ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_TIMEOUT, HANDLE, WAIT_EVENT, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
@@ -498,10 +499,7 @@ impl OverlappedCall {
                 "OverlappedCall: IOCTL wait timed out; IRP still pending",
             ));
         }
-        Err(windows::core::Error::new(
-            ERROR_TIMEOUT.to_hresult(),
-            "OverlappedCall: WaitForSingleObject failed while waiting for IRP",
-        ))
+        Err(wait_failure_error(wait))
     }
 
     /// [`wait_bounded`](Self::wait_bounded) with [`IOCTL_DEFAULT_TIMEOUT_MS`].
@@ -545,13 +543,32 @@ impl OverlappedCall {
             if wait == WAIT_TIMEOUT {
                 continue;
             }
-            // WAIT_FAILED (or unexpected status): surface as a generic wait failure.
-            return Err(windows::core::Error::new(
-                ERROR_TIMEOUT.to_hresult(),
-                "OverlappedCall: WaitForSingleObject failed while waiting for IRP",
-            ));
+            return Err(wait_failure_error(wait));
         }
     }
+}
+
+/// Error for a `WaitForSingleObject` status other than `WAIT_OBJECT_0` /
+/// `WAIT_TIMEOUT`. Call immediately after the wait so the thread's last error
+/// still belongs to it.
+///
+/// `WAIT_FAILED` carries the thread's last error. Anything else (or a
+/// `WAIT_FAILED` with no last error set) becomes `E_UNEXPECTED`, never
+/// `ERROR_TIMEOUT`, so callers can't mistake it for a timeout.
+fn wait_failure_error(wait: WAIT_EVENT) -> windows::core::Error {
+    if wait == WAIT_FAILED {
+        let err = windows::core::Error::from_thread();
+        if err.code().is_err() {
+            return err;
+        }
+    }
+    windows::core::Error::new(
+        E_UNEXPECTED,
+        format!(
+            "OverlappedCall: WaitForSingleObject returned {:#x} while waiting for IRP",
+            wait.0
+        ),
+    )
 }
 
 pub(crate) fn ensure_full_transfer(
@@ -709,6 +726,28 @@ mod tests {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::core::w;
+
+    /// `WAIT_FAILED` surfaces the thread's last error, not `ERROR_TIMEOUT` (F7).
+    #[test]
+    fn wait_failure_error_reports_last_error() {
+        // SAFETY: waiting on a null handle is defined to fail with
+        // ERROR_INVALID_HANDLE; nothing is dereferenced.
+        let wait = unsafe { WaitForSingleObject(HANDLE::default(), 0) };
+        assert_eq!(wait, WAIT_FAILED);
+        let err = wait_failure_error(wait);
+        assert_eq!(
+            err.code(),
+            windows::Win32::Foundation::ERROR_INVALID_HANDLE.to_hresult()
+        );
+    }
+
+    /// An unexpected status maps to `E_UNEXPECTED`, not `ERROR_TIMEOUT` (F7).
+    #[test]
+    fn wait_failure_error_unexpected_status() {
+        let err = wait_failure_error(WAIT_EVENT(0x80)); // WAIT_ABANDONED_0
+        assert_eq!(err.code(), E_UNEXPECTED);
+        assert_ne!(err.code(), ERROR_TIMEOUT.to_hresult());
+    }
 
     /// Overlapped `NUL` handle for `CancelIoEx` tests without ViGEmBus.
     fn open_nul_overlapped() -> HANDLE {

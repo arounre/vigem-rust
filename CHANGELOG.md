@@ -41,6 +41,26 @@ All notable changes to this project are documented here. The format is based on
   time, and nothing resends it. Ignoring the error on a button release leaves the button stuck. The
   docs (`BusError::TargetNotReady`, `Ready`, the `update` methods, README) now say the report was
   not delivered, when to send it again, and show a short resend loop. No behaviour change.
+- **`Client::connect` reported unrelated failures as `VersionMismatch`.** Any failed version check
+  except `ERROR_INVALID_PARAMETER` was treated as an incompatible driver, so a timeout or a bus
+  device that went away during connect told you to reinstall ViGEmBus. The driver signals a real
+  mismatch only with `ERROR_NOT_SUPPORTED`; now only that code gives `VersionMismatch`, and every
+  other failure is `BusNotFound` with the actual error as its `source`. A failed interface-size
+  lookup during connect is now kept as that `source` too, instead of being dropped.
+- **`plug` threw away pads the host was slow to start.** ViGEmBus waits only 1 s for the host to
+  start a new pad and then fails `WAIT_DEVICE_READY` with `ERROR_DEVICE_HARDWARE_ERROR`. `plug`
+  treated that as fatal, unplugged the pad and returned a `Bus` error, though the pad usually
+  becomes usable shortly after (first plug on a machine while Windows installs drivers, or a busy
+  system). Now `plug` keeps the pad and `wait_for_ready` decides, as it already did for drivers
+  without `WAIT_DEVICE_READY`. Other wait failures still unplug and fail.
+- **A timed-out `plug` could leave a pad nobody owned.** If the plug request itself hit this
+  crate's 5 s IOCTL timeout, the driver might still have created the pad, but `plug` returned
+  without removing it and freed its serial. The pad stayed until the `Client` and all its handles were dropped. Now
+  `plug` sends a best-effort unplug for that serial before returning the error.
+- **A failed wait on a driver request was reported as a timeout.** If waiting for a ViGEmBus
+  request failed outright (not timed out), the error still carried `ERROR_TIMEOUT`, so it looked
+  like a slow driver and hid the real cause. Now the error carries the Windows error from the
+  failed wait, or `E_UNEXPECTED` if Windows gave none. This should almost never happen in practice.
 - Removed the docs claim that using `register_notification` and `register_notification_raw_buffer`
   on one pad "may split host output between them".
 
