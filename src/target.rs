@@ -1359,6 +1359,12 @@ impl<'a, T: Device> TargetBuilder<'a, T> {
     /// Defaults: `0x045E` (Microsoft) for Xbox 360, `0x054C` (Sony) for DualShock 4.
     /// Most apps should leave this alone: games and anti-cheat often expect the
     /// real vendor id.
+    ///
+    /// Passing `0` doesn't give the pad vendor id 0. If the vendor id or the
+    /// product id is `0`, the driver ignores **both** and uses its defaults for the
+    /// pad type. These are the same defaults listed above. So
+    /// `.with_vid(0).with_pid(0x1234)` plugs a pad that reports the default product
+    /// id, not `0x1234`.
     #[inline]
     pub fn with_vid(mut self, vid: u16) -> Self {
         self.vid = Some(vid);
@@ -1368,6 +1374,12 @@ impl<'a, T: Device> TargetBuilder<'a, T> {
     /// USB product ID reported to the host.
     ///
     /// Defaults: `0x028E` (Xbox 360 Controller), `0x05C4` (DualShock 4).
+    ///
+    /// Passing `0` doesn't give the pad product id 0. If the vendor id or the
+    /// product id is `0`, the driver ignores **both** and uses its defaults for the
+    /// pad type. These are the same defaults listed here and on
+    /// [`with_vid`](Self::with_vid). So `.with_vid(0x1234).with_pid(0)` plugs a pad
+    /// that reports the default vendor id, not `0x1234`.
     #[inline]
     pub fn with_pid(mut self, pid: u16) -> Self {
         self.pid = Some(pid);

@@ -63,6 +63,9 @@ All notable changes to this project are documented here. The format is based on
   failed wait, or `E_UNEXPECTED` if Windows gave none. This should almost never happen in practice.
 - Removed the docs claim that using `register_notification` and `register_notification_raw_buffer`
   on one pad "may split host output between them".
+- `with_vid` / `with_pid` now document that a `0` for either id makes ViGEmBus ignore both and use
+  its defaults for the pad type (`045E:028E` for Xbox 360, `054C:05C4` for DualShock 4). No
+  behaviour change.
 
 ## [0.2.0]
 
