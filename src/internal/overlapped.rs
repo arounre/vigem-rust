@@ -291,6 +291,32 @@ impl OverlappedCall {
         out_len: u32,
         timeout_ms: u32,
     ) -> Result<u32, windows::core::Error> {
+        // SAFETY: forwarded unchanged; caller upholds the same contract.
+        let n = unsafe {
+            self.ioctl_timeout_any_len(code, input, in_len, output, out_len, timeout_ms)?
+        };
+        ensure_full_transfer(n, out_len)?;
+        Ok(n)
+    }
+
+    /// [`ioctl_timeout`](Self::ioctl_timeout) without the full-transfer check:
+    /// a request the driver completed successfully is `Ok` with however many
+    /// bytes it returned, including fewer than `out_len`.
+    ///
+    /// For IOCTLs where a short transfer is a valid answer
+    /// (`XUSB_GET_USER_INDEX` on current ViGEmBus succeeds with 0 bytes).
+    ///
+    /// # Safety
+    /// Same as [`ioctl_timeout`](Self::ioctl_timeout).
+    pub(crate) unsafe fn ioctl_timeout_any_len(
+        &mut self,
+        code: u32,
+        input: *const c_void,
+        in_len: u32,
+        output: *mut c_void,
+        out_len: u32,
+        timeout_ms: u32,
+    ) -> Result<u32, windows::core::Error> {
         self.reset()?;
 
         let handle = self.handle();
@@ -329,7 +355,6 @@ impl OverlappedCall {
             Err(e) => return Err(e),
         };
 
-        ensure_full_transfer(n, out_len)?;
         Ok(n)
     }
 

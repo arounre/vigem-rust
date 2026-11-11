@@ -266,7 +266,7 @@ fn is_optional_wait_device_ready_error(err: &windows::core::Error) -> bool {
 /// ViGEmBus waits at most 1 s for the host to start a new pad, then completes
 /// `WAIT_DEVICE_READY` with `STATUS_DEVICE_HARDWARE_ERROR`
 /// (`ERROR_DEVICE_HARDWARE_ERROR`, 483). The pad still exists and may become
-/// usable once the host catches up (first plug on a machine, loaded system).
+/// usable once the host catches up (for example on a slow or busy system).
 fn is_wait_device_ready_driver_timeout(err: &windows::core::Error) -> bool {
     err.code() == ERROR_DEVICE_HARDWARE_ERROR.to_hresult()
 }
@@ -917,7 +917,14 @@ impl Bus {
     }
 
     #[cfg(feature = "x360")]
-    pub(crate) fn get_x360_user_index(&self, serial_no: u32) -> Result<u32, BusError> {
+    /// Query the pad's XInput user index.
+    ///
+    /// - `Err` with Win32 650: the host has not assigned a slot yet.
+    /// - `Ok(Some(index))`: assigned, and the driver returned the value.
+    /// - `Ok(None)`: assigned, but the driver returned no data. ViGEmBus
+    ///   1.21.442 completes the request successfully with 0 bytes once a slot
+    ///   is assigned (measured), so the value never reaches user mode.
+    pub(crate) fn get_x360_user_index(&self, serial_no: u32) -> Result<Option<u32>, BusError> {
         // Separate in/out buffers - no aliasing through one object.
         let size = wire_size_of::<XusbGetUserIndex>();
         let mut io = IoctlBuffers::new(
@@ -937,10 +944,17 @@ impl Bus {
 
         let in_ptr = io.request_as_void();
         let out_ptr = io.response_as_void_mut();
+        // A short transfer is a valid answer here, so no full-transfer check.
         // SAFETY: two distinct heap buffers owned by `io` for the IRP lifetime.
         let ioctl_result = unsafe {
-            io.call()
-                .ioctl(IOCTL_XUSB_GET_USER_INDEX, in_ptr, size, out_ptr, size)
+            io.call().ioctl_timeout_any_len(
+                IOCTL_XUSB_GET_USER_INDEX,
+                in_ptr,
+                size,
+                out_ptr,
+                size,
+                crate::internal::overlapped::IOCTL_DEFAULT_TIMEOUT_MS,
+            )
         };
 
         if io.finish() {
@@ -952,8 +966,9 @@ impl Bus {
             ));
         }
 
-        ioctl_result.map_err(map_ioctl(Operation::XUSB_GET_USER_INDEX, Some(serial_no)))?;
-        Ok(io.response().user_index)
+        let transferred =
+            ioctl_result.map_err(map_ioctl(Operation::XUSB_GET_USER_INDEX, Some(serial_no)))?;
+        Ok((transferred >= size).then(|| io.response().user_index))
     }
 }
 

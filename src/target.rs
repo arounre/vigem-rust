@@ -73,15 +73,6 @@ fn is_retryable_ready_error(err: &ClientError) -> bool {
 #[cfg(feature = "x360")]
 const ERROR_INVALID_DEVICE_OBJECT_PARAMETER: u32 = 650;
 
-/// Win32 form of `STATUS_BUFFER_TOO_SMALL`.
-///
-/// Measured on ViGEmBus 1.21.442: once the pad has a slot, the driver's
-/// `GetUserIndex` succeeds, but the request still reaches user mode as this
-/// error and the index value is lost. (`ViGEmClient` ignores this error and
-/// reports index 0.) For readiness only the fact matters, so treat it as "assigned".
-#[cfg(feature = "x360")]
-const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-
 /// Does `err` carry `code` from `XUSB_GET_USER_INDEX`?
 #[cfg(feature = "x360")]
 #[inline]
@@ -99,7 +90,9 @@ fn is_user_index_code(err: &ClientError, code: u32) -> bool {
 /// - `DeviceGone`: for about the first millisecond after `PLUGIN_TARGET` the
 ///   driver does not know the serial yet. Without `WAIT_DEVICE_READY`, `plug`
 ///   returns inside that window. The wait checks this client's own liveness
-///   flag every round, so a real unplug still ends it.
+///   flag every round, so a real unplug still ends it, and if the driver
+///   still says `DeviceGone` when the deadline passes the wait returns that
+///   error instead of `ReadyTimeout`.
 ///
 /// Every other failure (access denied, unclassified IOCTL errors, ...) is a
 /// hard error for `wait_for_ready`.
@@ -116,14 +109,11 @@ fn is_user_index_pending(err: &ClientError) -> bool {
 
 /// Map a user-index query result to a readiness probe result.
 ///
-/// `ERROR_INSUFFICIENT_BUFFER` means "assigned" (see [`ERROR_INSUFFICIENT_BUFFER`]).
+/// Any success means the host has assigned a slot, whether or not the driver
+/// returned the value (`Ok(None)`; see [`Bus::get_x360_user_index`]).
 #[cfg(feature = "x360")]
-fn user_index_probe(result: Result<u32, BusError>) -> Result<(), ClientError> {
-    match result.map_err(ClientError::from) {
-        Ok(_) => Ok(()),
-        Err(e) if is_user_index_code(&e, ERROR_INSUFFICIENT_BUFFER) => Ok(()),
-        Err(e) => Err(e),
-    }
+fn user_index_probe(result: Result<Option<u32>, BusError>) -> Result<(), ClientError> {
+    result.map(|_| ()).map_err(ClientError::from)
 }
 
 /// Default queue size for rumble / LED (and similar) notifications (currently `4`).
@@ -664,6 +654,8 @@ impl<T: Device> TargetHandle<T, Pending> {
     /// is [`ClientError::ReadyTimeout`]. The deadline is checked only after a
     /// retryable error (`checked_add` overflow = no deadline). The first miss is
     /// retried immediately; later misses back off by [`READY_POLL_INTERVAL`].
+    /// When a non-zero deadline passes, the result is `ReadyTimeout`, unless the
+    /// last retried error was [`BusError::DeviceGone`], which is returned as-is.
     ///
     /// Takes `&self` so a timeout does not drop this handle (and therefore does
     /// not unplug the pad). Success returns a `Ready` clone of the same identity.
@@ -695,6 +687,11 @@ impl<T: Device> TargetHandle<T, Pending> {
                 Err(e) if is_retryable(&e) && deadline.is_none_or(|d| Instant::now() < d) => {
                     thread::sleep(READY_POLL_INTERVAL);
                 }
+                // Deadline passed. A pad the driver still does not know after
+                // the whole wait is gone, not coming up: say so.
+                Err(e @ ClientError::Bus(BusError::DeviceGone { .. })) if is_retryable(&e) => {
+                    return Err(e);
+                }
                 Err(e) if is_retryable(&e) => {
                     return Err(ClientError::ReadyTimeout { timeout });
                 }
@@ -717,11 +714,13 @@ impl TargetHandle<Xbox360, Pending> {
     /// - **Current ViGEmBus drivers:** `plug` already asked the driver to wait
     ///   until the host sent the pad its first LED packet. If that succeeded,
     ///   this only checks the pad is still plugged and returns at once.
-    /// - **Drivers without that wait:** polls the pad's XInput user index every
-    ///   10 ms. The driver reports one only after the host's LED packet, so a
-    ///   success means the host is talking to the pad.
+    /// - **If the driver did not confirm it** (an older driver without that
+    ///   wait, or the host took longer than the driver's 1 s wait, as it can on
+    ///   a slow or busy system): polls the pad's XInput
+    ///   user index every 10 ms. The driver reports one only after the host's
+    ///   LED packet, so a success means the host is talking to the pad.
     ///
-    /// No reports are sent. On an older driver, a pad beyond the fourth XInput
+    /// No reports are sent. In the polling case, a pad beyond the fourth XInput
     /// slot may never get a user index, and this then times out. Use
     /// [`assume_ready`](Self::assume_ready) in that case.
     ///
@@ -733,7 +732,9 @@ impl TargetHandle<Xbox360, Pending> {
     ///
     /// - [`ClientError::ReadyTimeout`]: the host did not start the pad in time
     /// - [`ClientError::TargetDoesNotExist`]: the pad was unplugged
-    /// - [`ClientError::Bus`]: any other driver failure
+    /// - [`ClientError::Bus`]: any other driver failure, including
+    ///   [`BusError::DeviceGone`] if the driver still does not know the pad
+    ///   when the timeout passes
     pub fn wait_for_ready(&self) -> Result<TargetHandle<Xbox360, Ready>, ClientError> {
         self.wait_for_ready_timeout(DEFAULT_READY_TIMEOUT)
     }
@@ -1026,23 +1027,43 @@ where
 #[cfg(feature = "x360")]
 #[cfg_attr(docsrs, doc(cfg(feature = "x360")))]
 impl TargetHandle<Xbox360, Ready> {
-    /// XInput-style user index reported by the driver.
+    /// XInput slot (`0..=3`) the host assigned to this pad, as reported by the driver.
     ///
-    /// Often stays `0` even after a game assigns a player. For the player LED
-    /// number shown on a real pad, prefer
-    /// [`register_notification`](Self::register_notification) and
-    /// [`X360Notification::led_number`].
+    /// **This does not work on current ViGEmBus drivers.** Measured on
+    /// 1.21.442: once the host has assigned a slot, the driver answers the
+    /// query successfully but returns no data, so the value is not available
+    /// and this returns an error (see below). Only older drivers return it.
+    /// (`ViGEmClient` reports `0` in the same situation, which is where "the
+    /// user index is always 0" comes from.)
+    ///
+    /// Use [`register_notification`](Self::register_notification) and
+    /// [`X360Notification::led_number`] instead: the host's LED packet carries
+    /// the same slot number and works on every driver.
     ///
     /// # Errors
     ///
     /// - [`ClientError::TargetDoesNotExist`]: this pad was unplugged
     /// - [`ClientError::ClientNoLongerExists`]: the owning client was dropped
     /// - [`ClientError::Poisoned`]: another thread panicked while holding client state
-    /// - [`ClientError::Bus`]: driver failure
+    /// - [`BusError::UserIndexUnavailable`]: a slot is assigned but the driver
+    ///   did not return its number
+    /// - [`ClientError::Bus`]: other driver failure. [`BusError::Ioctl`] with
+    ///   Win32 `650` (`ERROR_INVALID_DEVICE_OBJECT_PARAMETER`) means the host
+    ///   has not assigned a slot yet.
+    #[deprecated(
+        since = "0.2.1",
+        note = "current ViGEmBus drivers do not return the index; use `register_notification` and `X360Notification::led_number`"
+    )]
     pub fn user_index(&self) -> Result<u32, ClientError> {
         self.assert_live()?;
-        let index = self.inner.bus.get_x360_user_index(self.inner.serial_no)?;
-        Ok(index)
+        let serial_no = self.inner.serial_no;
+        match self.inner.bus.get_x360_user_index(serial_no)? {
+            Some(index) => Ok(index),
+            // Assigned, but the driver returned no bytes.
+            None => Err(ClientError::Bus(BusError::UserIndexUnavailable {
+                serial_no,
+            })),
+        }
     }
 
     /// Alias for [`user_index`](Self::user_index).
@@ -1053,6 +1074,7 @@ impl TargetHandle<Xbox360, Ready> {
     #[deprecated(since = "0.2.0", note = "renamed to `user_index`")]
     #[inline]
     pub fn get_user_index(&self) -> Result<u32, ClientError> {
+        #[allow(deprecated)]
         self.user_index()
     }
 
@@ -1791,6 +1813,48 @@ mod tests {
 
     #[test]
     #[cfg(feature = "x360")]
+    fn x360_unknown_device_gone_at_deadline_is_device_gone() {
+        let client = Client::null_for_tests(4);
+        let handle = x360_pending(&client, PlugReadiness::Unknown);
+        let serial = handle.serial_no();
+        let gone = || {
+            Err(ClientError::Bus(BusError::DeviceGone {
+                operation: Operation::XUSB_GET_USER_INDEX,
+                serial_no: Some(serial),
+            }))
+        };
+        let timeout = Duration::from_millis(50);
+        let probes = RefCell::new(0u32);
+
+        let started = Instant::now();
+        let err = handle
+            .wait_x360_with(timeout, |_| {
+                *probes.borrow_mut() += 1;
+                gone()
+            })
+            .expect_err("never known -> error");
+        assert!(
+            matches!(
+                err,
+                ClientError::Bus(BusError::DeviceGone {
+                    operation: Operation::XUSB_GET_USER_INDEX,
+                    serial_no: Some(s),
+                }) if s == serial
+            ),
+            "got {err:?}"
+        );
+        assert!(started.elapsed() >= timeout);
+        assert!(*probes.borrow() >= 2);
+
+        // Zero timeout: single poll, still reported as a timeout.
+        let err = handle
+            .wait_x360_with(Duration::ZERO, |_| gone())
+            .expect_err("zero timeout");
+        assert!(matches!(err, ClientError::ReadyTimeout { timeout } if timeout.is_zero()));
+    }
+
+    #[test]
+    #[cfg(feature = "x360")]
     fn x360_unknown_only_pending_index_is_retryable() {
         let client = Client::null_for_tests(4);
         let handle = x360_pending(&client, PlugReadiness::Unknown);
@@ -1833,7 +1897,8 @@ mod tests {
     }
 
     /// Sequence measured on ViGEmBus 1.21.442 right after `PLUGIN_TARGET`:
-    /// `DeviceGone` (serial not known yet) -> 650 (no slot) -> 122 (assigned).
+    /// `DeviceGone` (serial not known yet) -> 650 (no slot) -> success with
+    /// 0 bytes (assigned, no value returned).
     #[test]
     #[cfg(feature = "x360")]
     fn x360_unknown_follows_measured_driver_sequence() {
@@ -1854,7 +1919,7 @@ mod tests {
                     serial_no: Some(serial),
                 }),
                 Err(ioctl(ERROR_INVALID_DEVICE_OBJECT_PARAMETER)),
-                Err(ioctl(ERROR_INSUFFICIENT_BUFFER)),
+                Ok(None),
             ]
             .into_iter(),
         );
@@ -1863,7 +1928,7 @@ mod tests {
             .wait_x360_with(Duration::from_secs(1), |_| {
                 user_index_probe(script.borrow_mut().next().expect("script exhausted"))
             })
-            .expect("122 means the index is assigned");
+            .expect("success with no value means the index is assigned");
         assert!(script.borrow_mut().next().is_none(), "all three probed");
     }
 
@@ -1873,28 +1938,18 @@ mod tests {
         let ioctl = |op, code| {
             BusError::classify_ioctl(op, Some(1), crate::error::Win32Error::from_win32(code))
         };
-        assert!(user_index_probe(Ok(2)).is_ok());
-        assert!(
-            user_index_probe(Err(ioctl(
-                Operation::XUSB_GET_USER_INDEX,
-                ERROR_INSUFFICIENT_BUFFER
-            )))
-            .is_ok()
-        );
+        assert!(user_index_probe(Ok(Some(2))).is_ok());
+        assert!(user_index_probe(Ok(None)).is_ok());
         let pending = user_index_probe(Err(ioctl(
             Operation::XUSB_GET_USER_INDEX,
             ERROR_INVALID_DEVICE_OBJECT_PARAMETER,
         )))
         .expect_err("650 is not ready");
         assert!(is_user_index_pending(&pending));
-        // 122 from another operation is not mapped.
-        assert!(
-            user_index_probe(Err(ioctl(
-                Operation::XUSB_SUBMIT_REPORT,
-                ERROR_INSUFFICIENT_BUFFER
-            )))
-            .is_err()
-        );
+        // 122 is an ordinary driver error, not "assigned" and not retryable.
+        let hard = user_index_probe(Err(ioctl(Operation::XUSB_GET_USER_INDEX, 122)))
+            .expect_err("122 is a hard error");
+        assert!(!is_user_index_pending(&hard));
     }
 
     const fn assert_send_sync<T: Send + Sync>() {}

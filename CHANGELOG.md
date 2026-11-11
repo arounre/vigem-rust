@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+### Added
+
+- `BusError::UserIndexUnavailable`: returned by `user_index()` when the host has assigned an XInput
+  slot but the driver did not return its number (see Fixed).
+
+### Deprecated
+
+- `TargetHandle::user_index()`. Current ViGEmBus drivers do not return the number. Use
+  `register_notification` and `X360Notification::led_number`, which carries the same slot number
+  on every driver.
+
 ### Fixed
 
 - **DS4 raw output reports went to the wrong pad.** `register_notification_raw_buffer` ran one
@@ -24,10 +35,20 @@ All notable changes to this project are documented here. The format is based on
   that don't, you got a `Ready` handle with no evidence the host had seen the pad. Now `plug`
   records whether the driver confirmed readiness. If it did, `wait_for_ready` returns at once. If
   not, it polls the pad's XInput user index, which the driver only reports after the host's first
-  LED packet, and times out with `ReadyTimeout` otherwise. (On ViGEmBus 1.21.442 an assigned index
-  comes back as `ERROR_INSUFFICIENT_BUFFER` with the value lost; the wait counts that as assigned.)
-  It no longer sends any reports. On an
-  older driver, a fifth or later Xbox 360 pad may never get an index; use `assume_ready` for those.
+  LED packet. It no longer sends any reports. When it has to poll, a fifth or later Xbox 360 pad
+  may never get an index; use `assume_ready` for those. If the timeout passes it returns
+  `ReadyTimeout`, or `BusError::DeviceGone` if the driver still says the pad does not exist.
+- **`user_index()` failed with a made-up `ERROR_INSUFFICIENT_BUFFER`.** Current ViGEmBus drivers
+  (measured on 1.21.442) answer the user-index query successfully but return no data, and this
+  crate turned that into an "insufficient buffer" error. The number cannot be read from that
+  driver call. `user_index()` now returns the new `BusError::UserIndexUnavailable` in that case,
+  and its docs say what it can and cannot do. Before the host assigns a slot it still fails with
+  Win32 650.
+- **Registering for notifications could panic.** If Windows refused to start the listener thread,
+  `register_notification` and `register_notification_raw_buffer` panicked inside the library. They
+  now return `BusError::Ioctl` (operation `spawn notification worker`). Listener threads are named
+  `vigem-notify-{serial}` (per pad) and `vigem-notify-bus` (DS4 raw output) so they are easy to
+  find in a debugger.
 - **DualShock 4 `wait_for_ready` could time out on a ready pad.** It needed three neutral reports
   accepted back to back. Each accepted report uses up one read the host has waiting, so a host that
   kept fewer than three reads queued (a slow or busy machine) could reject the third, reset the
@@ -50,13 +71,13 @@ All notable changes to this project are documented here. The format is based on
 - **`plug` threw away pads the host was slow to start.** ViGEmBus waits only 1 s for the host to
   start a new pad and then fails `WAIT_DEVICE_READY` with `ERROR_DEVICE_HARDWARE_ERROR`. `plug`
   treated that as fatal, unplugged the pad and returned a `Bus` error, though the pad usually
-  becomes usable shortly after (first plug on a machine while Windows installs drivers, or a busy
-  system). Now `plug` keeps the pad and `wait_for_ready` decides, as it already did for drivers
-  without `WAIT_DEVICE_READY`. Other wait failures still unplug and fail.
+  becomes usable shortly after (for example on a slow or busy system). Now `plug` keeps the pad
+  and `wait_for_ready` decides, as it already did for drivers without `WAIT_DEVICE_READY`. Other
+  wait failures still unplug and fail.
 - **A timed-out `plug` could leave a pad nobody owned.** If the plug request itself hit this
   crate's 5 s IOCTL timeout, the driver might still have created the pad, but `plug` returned
-  without removing it and freed its serial. The pad stayed until the `Client` and all its handles were dropped. Now
-  `plug` sends a best-effort unplug for that serial before returning the error.
+  without removing it and freed its serial. The pad stayed until the `Client` and all its handles
+  were dropped. Now `plug` sends a best-effort unplug for that serial before returning the error.
 - **A failed wait on a driver request was reported as a timeout.** If waiting for a ViGEmBus
   request failed outright (not timed out), the error still carried `ERROR_TIMEOUT`, so it looked
   like a slow driver and hid the real cause. Now the error carries the Windows error from the

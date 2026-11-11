@@ -378,6 +378,22 @@ pub enum BusError {
         #[source]
         source: Option<Win32Error>,
     },
+
+    /// The host has given this Xbox 360 pad an XInput slot, but the driver did
+    /// not return its number.
+    ///
+    /// Only from [`user_index`](crate::TargetHandle::user_index). Current
+    /// ViGEmBus drivers (measured on 1.21.442) answer the query without any
+    /// data, so the number cannot be read this way. It is not a fault and
+    /// retrying does not help: read
+    /// [`X360Notification::led_number`](crate::X360Notification::led_number)
+    /// from [`register_notification`](crate::TargetHandle::register_notification)
+    /// instead.
+    #[error("target {serial_no} has an XInput user index, but the driver did not return it")]
+    UserIndexUnavailable {
+        /// Serial of the pad that was queried.
+        serial_no: u32,
+    },
 }
 
 impl BusError {
@@ -447,6 +463,7 @@ impl BusError {
             | Self::AccessDenied { operation, .. }
             | Self::Ioctl { operation, .. } => Some(*operation),
             Self::TargetNotReady { .. }
+            | Self::UserIndexUnavailable { .. }
             | Self::Enumeration { .. }
             | Self::VersionMismatch { .. }
             | Self::BusNotFound { .. } => None,
@@ -464,6 +481,7 @@ impl BusError {
             Self::DeviceGone { .. }
             | Self::AccessDenied { .. }
             | Self::TargetNotReady { .. }
+            | Self::UserIndexUnavailable { .. }
             | Self::VersionMismatch { .. } => None,
         }
     }
