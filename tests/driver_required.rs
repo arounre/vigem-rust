@@ -88,7 +88,261 @@ fn wait_for_ready_completes_under_1s() {
     ready.unplug().expect("unplug");
 }
 
-/// DS4 `wait_for_ready` on real plugs, then how well the host keeps up (review F3).
+/// Resending the identical Xbox 360 report after `TargetNotReady` delivers it.
+///
+/// The driver accepts an Xbox 360 report equal to its cached last report
+/// without touching the device. If it updated that cache before finding that
+/// the host had no read pending, a resend of a dropped report would compare
+/// equal, return `Ok`, and deliver nothing. This test proves it does not: the
+/// resent report is read back through `XInputGetState`.
+///
+/// Misses are provoked two ways: the first report right after each plug
+/// (`assume_ready`), and tight back-to-back bursts on the running pad. After a
+/// miss the same report is resent every 1 ms until accepted, then nothing else
+/// is sent while XInput is polled for that exact `(left_trigger, thumb_lx)`.
+/// Reports accepted at the first try are checked the same way as a control
+/// (the post-plug report, and the last report of each burst).
+///
+/// The pad's XInput slot is found by matching the first report on the slots
+/// that were free before the plug, so at least one slot must be free (two for
+/// the second half, where a blocker pad holds the lowest free slot). The
+/// driver's `led_number` is printed next to it for comparison.
+///
+/// Asserted: every resend after a miss shows up through XInput (within 3 s;
+/// the count within 500 ms is printed). If no miss was provoked, the run
+/// prints that and asserts nothing.
+///
+/// The first report is sent before `register_notification`: subscribing first
+/// gives the host time to start reading, and no miss happens.
+///
+/// 0.2.1, ViGEmBus 1.21.442, 25 plugs: 20 of 25 post-plug reports missed once;
+/// all 20 resends showed in XInput within ~5 ms (5/5 first-try controls too).
+/// The bursts (100 000 reports) never missed; 500/500 burst controls showed.
+/// `led_number` equalled the XInput slot (0 without, 1 with the blocker).
+#[test]
+#[ignore = "requires ViGEmBus driver"]
+#[cfg(feature = "x360")]
+fn x360_resend_after_target_not_ready_delivers() {
+    use vigem_rust::{BusError, ClientError, TargetHandle, X360Report, Xbox360};
+
+    const PLUGS: u32 = 25;
+    const BURSTS_PER_PLUG: u32 = 20;
+    const BURST_LEN: u32 = 200;
+    const VISIBLE: Duration = Duration::from_millis(500);
+    const GIVE_UP: Duration = Duration::from_secs(3);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct XInputGamepad {
+        buttons: u16,
+        left_trigger: u8,
+        right_trigger: u8,
+        thumb_lx: i16,
+        thumb_ly: i16,
+        thumb_rx: i16,
+        thumb_ry: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct XInputState {
+        packet_number: u32,
+        gamepad: XInputGamepad,
+    }
+
+    #[link(name = "xinput1_4", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn XInputGetState(user_index: u32, state: *mut XInputState) -> u32;
+    }
+
+    fn xinput(slot: u32) -> Option<XInputGamepad> {
+        let mut state = XInputState::default();
+        // SAFETY: `state` is a live XINPUT_STATE with the C layout.
+        (unsafe { XInputGetState(slot, &mut state) } == 0).then_some(state.gamepad)
+    }
+
+    /// Non-zero and different from the previous sequence number's report.
+    fn report_for(seq: u32) -> X360Report {
+        X360Report {
+            left_trigger: (seq % 255 + 1) as u8,
+            thumb_lx: (seq % 32_000 + 1) as i16,
+            ..X360Report::default()
+        }
+    }
+
+    /// Slot and delay at which `report` shows on one of `slots`, polling up to `GIVE_UP`.
+    fn seen_on(slots: &[u32], report: &X360Report) -> Option<(u32, Duration)> {
+        let start = Instant::now();
+        loop {
+            for &slot in slots {
+                if let Some(pad) = xinput(slot)
+                    && pad.left_trigger == report.left_trigger
+                    && pad.thumb_lx == report.thumb_lx
+                {
+                    return Some((slot, start.elapsed()));
+                }
+            }
+            if start.elapsed() >= GIVE_UP {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Sends `report`, resending the same one every 1 ms while the driver
+    /// returns `TargetNotReady`. Returns how many misses came before `Ok`.
+    fn send_until_ok(pad: &TargetHandle<Xbox360>, report: &X360Report) -> u32 {
+        let mut misses = 0u32;
+        loop {
+            match pad.update(report) {
+                Ok(()) => return misses,
+                Err(ClientError::Bus(BusError::TargetNotReady { .. })) => {
+                    misses += 1;
+                    assert!(misses < 5_000, "report never accepted");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("unexpected update error: {e:?}"),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Tally {
+        checked: u32,
+        within_500ms: u32,
+        late: u32,
+        never: u32,
+        max_delay: Duration,
+    }
+
+    impl Tally {
+        fn record(&mut self, seen: Option<(u32, Duration)>) {
+            self.checked += 1;
+            match seen {
+                Some((_, delay)) if delay <= VISIBLE => self.within_500ms += 1,
+                Some(_) => self.late += 1,
+                None => self.never += 1,
+            }
+            if let Some((_, delay)) = seen {
+                self.max_delay = self.max_delay.max(delay);
+            }
+        }
+    }
+
+    let _guard = driver_lock();
+    let client = Client::connect().expect("ViGEmBus must be installed for this test");
+
+    let mut seq = 0u32;
+    let mut resent_after_plug = Tally::default();
+    let mut resent_in_burst = Tally::default();
+    let mut control_after_plug = Tally::default();
+    let mut control_in_burst = Tally::default();
+    let mut not_ready_total = 0u32;
+    let mut led_and_slot: Vec<(Option<u8>, Option<u32>)> = Vec::new();
+
+    // Second half: a blocker pad holds the lowest free slot, so the pad under
+    // test gets a higher one and `led_number` can be compared with the slot.
+    let mut blocker = None;
+    for plug_no in 0..PLUGS {
+        if plug_no == PLUGS / 2 {
+            let free_before = (0..4).filter(|&slot| xinput(slot).is_none()).count();
+            let pad = client
+                .new_x360_target()
+                .plug()
+                .expect("blocker plugin")
+                .assume_ready();
+            send_until_ok(&pad, &X360Report::default());
+            let start = Instant::now();
+            while (0..4).filter(|&slot| xinput(slot).is_none()).count() == free_before
+                && start.elapsed() < GIVE_UP
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            blocker = Some(pad);
+        }
+        let free: Vec<u32> = (0..4).filter(|&slot| xinput(slot).is_none()).collect();
+        assert!(
+            !free.is_empty(),
+            "all four XInput slots are taken; disconnect a controller"
+        );
+
+        let pad = client
+            .new_x360_target()
+            .plug()
+            .expect("plugin should succeed")
+            .assume_ready();
+
+        seq += 1;
+        let report = report_for(seq);
+        let misses = send_until_ok(&pad, &report);
+        not_ready_total += misses;
+        let notifications = pad.register_notification().expect("register_notification");
+        let seen = seen_on(&free, &report);
+        if misses > 0 {
+            resent_after_plug.record(seen);
+        } else {
+            control_after_plug.record(seen);
+        }
+
+        let led = notifications
+            .recv_timeout(Duration::from_secs(2))
+            .ok()
+            .map(|n| n.led_number);
+        let slot = seen.map(|(slot, _)| slot);
+        led_and_slot.push((led, slot));
+
+        if let Some(slot) = slot {
+            for _ in 0..BURSTS_PER_PLUG {
+                let mut last_first_try = None;
+                for _ in 0..BURST_LEN {
+                    seq += 1;
+                    let report = report_for(seq);
+                    let misses = send_until_ok(&pad, &report);
+                    not_ready_total += misses;
+                    if misses > 0 {
+                        resent_in_burst.record(seen_on(&[slot], &report));
+                        last_first_try = None;
+                    } else {
+                        last_first_try = Some(report);
+                    }
+                }
+                if let Some(report) = last_first_try {
+                    control_in_burst.record(seen_on(&[slot], &report));
+                }
+            }
+        }
+
+        drop(notifications);
+        pad.unplug().expect("unplug");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Some(pad) = blocker {
+        pad.unplug().expect("unplug blocker");
+    }
+
+    eprintln!(
+        "x360 resend after TargetNotReady: {PLUGS} plugs, {seq} reports, \
+         TargetNotReady returns={not_ready_total}\n  \
+         resent after plug miss: {resent_after_plug:?}\n  \
+         resent after burst miss: {resent_in_burst:?}\n  \
+         control after plug (first-try Ok): {control_after_plug:?}\n  \
+         control end of burst (first-try Ok): {control_in_burst:?}\n  \
+         (led_number, XInput slot) per plug: {led_and_slot:?}"
+    );
+
+    let resent = resent_after_plug.checked + resent_in_burst.checked;
+    if resent == 0 {
+        eprintln!("no TargetNotReady provoked in this run; nothing to assert");
+        return;
+    }
+    assert_eq!(
+        resent_after_plug.never + resent_in_burst.never,
+        0,
+        "a report resent after TargetNotReady was accepted but never reached XInput"
+    );
+}
+
+/// DS4 `wait_for_ready` on real plugs, then how well the host keeps up.
 ///
 /// Phase 1 replays the `poll_until_ready` policy through public `update` (same
 /// submit path as the probe): first miss retried at once, later misses sleep
@@ -98,8 +352,8 @@ fn wait_for_ready_completes_under_1s() {
 ///
 /// Phase 2, on the same pad once ready, sends a back-to-back burst and records
 /// how many submits succeed before the first miss. Each accepted submit uses up
-/// one pending host read (review D2), so misses here mean the host fell behind.
-/// Printed only; useful for A2's retry back-off and for rechecking on other
+/// one pending host read, so misses here mean the host fell behind.
+/// Printed only; useful for choosing a retry back-off and for rechecking on other
 /// drivers, several pads, or a loaded machine.
 ///
 /// 0.2.1, ViGEmBus 1.21.442, one pad, 20 plugs: every plug `xxO` in ~10 ms;
@@ -169,7 +423,12 @@ fn ds4_probe_sequence_after_plug() {
         }
         // Long sequences: keep head and tail.
         if seq.len() > 40 {
-            seq = format!("{}…{} (len {})", &seq[..20], &seq[seq.len() - 10..], seq.len());
+            seq = format!(
+                "{}…{} (len {})",
+                &seq[..20],
+                &seq[seq.len() - 10..],
+                seq.len()
+            );
         }
         sequences.push(seq);
 
@@ -202,7 +461,10 @@ fn ds4_probe_sequence_after_plug() {
         "  successes before first miss: {burst_first_miss:?}\n  misses per burst: {burst_misses:?}"
     );
 
-    assert_eq!(timed_out, 0, "probe replay hit ReadyTimeout on a plugged pad");
+    assert_eq!(
+        timed_out, 0,
+        "probe replay hit ReadyTimeout on a plugged pad"
+    );
 }
 
 /// After a bus-level `update` failure, a later `update` on the same handle works.

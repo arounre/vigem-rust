@@ -37,6 +37,8 @@ use crate::controller::x360::{X360Notification, X360Report, XusbSubmitReport};
 use crate::error::{BusError, Operation, Win32Error};
 use crate::internal::ioctl::*;
 use crate::internal::notification_workers::*;
+#[cfg(feature = "ds4")]
+use crate::internal::overlapped::Ds4OutputSlot;
 use crate::internal::overlapped::{
     BusInner, IOCTL_TEARDOWN_TIMEOUT_MS, IoctlBuffers, OverlappedCall, WAIT_POLL_MS,
     ensure_full_transfer,
@@ -123,6 +125,46 @@ fn classify_connect_failure(
     } else {
         BusError::BusNotFound { source: None }
     }
+}
+
+/// Open the bus device at `path` (NUL-terminated UTF-16) for overlapped I/O.
+fn open_device(path: &[u16]) -> windows::core::Result<windows::Win32::Foundation::HANDLE> {
+    debug_assert_eq!(path.last(), Some(&0), "device path must be NUL-terminated");
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(path.as_ptr()),
+            (GENERIC_READ | GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL
+                | FILE_FLAG_NO_BUFFERING
+                | FILE_FLAG_WRITE_THROUGH
+                | FILE_FLAG_OVERLAPPED,
+            None,
+        )
+    }
+}
+
+/// Send `CHECK_VERSION` on a newly opened handle.
+fn check_version(bus: &Arc<BusInner>) -> windows::core::Result<()> {
+    let version = CheckVersion {
+        size: wire_size_of::<CheckVersion>(),
+        version: VIGEM_COMMON_VERSION,
+    };
+    // SAFETY: `version` lives for the call; no output buffer.
+    unsafe {
+        OverlappedCall::ioctl_sync(
+            bus,
+            IOCTL_VIGEM_CHECK_VERSION,
+            core::ptr::from_ref(&version).cast::<c_void>(),
+            version.size,
+            core::ptr::null_mut(),
+            0,
+        )
+    }
+    .map(|_| ())
 }
 
 #[derive(Clone)]
@@ -394,31 +436,27 @@ impl Bus {
                 continue;
             }
 
-            // Path pointer from the Vec allocation (not DevicePath's [u16; 1] field,
-            // which only carries 2-byte provenance).
-            // SAFETY: SetupAPI wrote a NUL-terminated path; `buf` outlives CreateFileW.
-            let handle = match unsafe {
-                let path = buf
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(core::mem::offset_of!(
-                        SP_DEVICE_INTERFACE_DETAIL_DATA_W,
-                        DevicePath
-                    ))
-                    .cast::<u16>();
-                CreateFileW(
-                    PCWSTR::from_raw(path),
-                    (GENERIC_READ | GENERIC_WRITE).0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL
-                        | FILE_FLAG_NO_BUFFERING
-                        | FILE_FLAG_WRITE_THROUGH
-                        | FILE_FLAG_OVERLAPPED,
-                    None,
+            // Copy the path out of the Vec allocation (not through DevicePath's
+            // [u16; 1] field, which only carries 2-byte provenance).
+            let path_offset = core::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+            let path_capacity = (core::mem::size_of_val(buf.as_slice()) - path_offset)
+                / core::mem::size_of::<u16>();
+            // SAFETY: `path_capacity` u16s starting at `path_offset` lie inside
+            // `buf`, which SetupAPI filled; the offset is 2-byte aligned.
+            let path_units = unsafe {
+                core::slice::from_raw_parts(
+                    buf.as_ptr().cast::<u8>().add(path_offset).cast::<u16>(),
+                    path_capacity,
                 )
-            } {
+            };
+            let path_len = path_units
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(path_capacity);
+            let mut device_path = path_units[..path_len].to_vec();
+            device_path.push(0);
+
+            let handle = match open_device(&device_path) {
                 Ok(h) => h,
                 Err(e) => {
                     last_error = Some(Win32Error::from(e));
@@ -429,29 +467,17 @@ impl Bus {
             // Wrap immediately so the version-check IOCTL can hold Arc like every other call.
             let mut candidate = Arc::new(BusInner::new(handle));
 
-            let version = CheckVersion {
-                size: wire_size_of::<CheckVersion>(),
-                version: VIGEM_COMMON_VERSION,
-            };
-            // SAFETY: `version` lives for the call; no output buffer.
-            let version_result = unsafe {
-                OverlappedCall::ioctl_sync(
-                    &candidate,
-                    IOCTL_VIGEM_CHECK_VERSION,
-                    core::ptr::from_ref(&version).cast::<c_void>(),
-                    version.size,
-                    core::ptr::null_mut(),
-                    0,
-                )
-            };
-
-            match version_result {
-                Ok(_) => {
-                    // Best-effort: failure degrades serial discovery to Off.
+            match check_version(&candidate) {
+                Ok(()) => {
                     // Sole owner of the Arc - get_mut succeeds.
                     if let Some(inner) = Arc::get_mut(&mut candidate) {
+                        // Best-effort: failure degrades serial discovery to Off.
                         inner.devnode_id =
                             crate::internal::devnode::read_device_instance_id(devinfo.DevInst).ok();
+                        #[cfg(feature = "ds4")]
+                        {
+                            inner.device_path = Some(device_path);
+                        }
                     }
                     return Ok(Bus { inner: candidate });
                 }
@@ -483,6 +509,12 @@ impl Bus {
     /// the pad, so a best-effort unplug is issued before returning the error.
     /// The caller holds `serial_no` reserved until this returns.
     pub(crate) fn plug(&self, target: &Target, serial_no: u32) -> Result<PlugReadiness, BusError> {
+        // Before the pad exists, so nothing the host sends to it is lost.
+        #[cfg(feature = "ds4")]
+        if target.kind == crate::target::TargetType::DualShock4 {
+            self.discard_stale_ds4_output();
+        }
+
         let plugin = PluginTarget {
             size: wire_size_of::<PluginTarget>(),
             serial_no,
@@ -674,13 +706,26 @@ impl Bus {
         W: NotificationWorker,
         S: NotificationSink<W::Notification>,
     {
-        let bus = Arc::clone(&self.inner);
+        Self::spawn_notification_thread_on::<W, S>(Arc::clone(&self.inner), serial_no, sink)
+    }
+
+    /// [`spawn_notification_thread`](Self::spawn_notification_thread) on an
+    /// explicit bus handle.
+    fn spawn_notification_thread_on<W, S>(
+        bus: Arc<BusInner>,
+        serial_no: Option<u32>,
+        sink: S,
+    ) -> Result<NotificationWorkerHandle, BusError>
+    where
+        W: NotificationWorker,
+        S: NotificationSink<W::Notification>,
+    {
         let state = Arc::new(WorkerState {
             slot: Mutex::new(WorkerSlot {
                 shutdown: false,
                 overlapped: None,
             }),
-            bus: Arc::clone(&self.inner),
+            bus: Arc::clone(&bus),
         });
         let state_thread = Arc::clone(&state);
 
@@ -892,13 +937,9 @@ impl Bus {
         fanout: Arc<Fanout<Ds4OutputBuffer>>,
     ) -> Result<Arc<Ds4OutputRouter>, BusError> {
         // Held across "upgrade or create" so two threads cannot start two routers.
-        let mut slot = self
-            .inner
-            .ds4_output_router
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.lock_ds4_output();
 
-        if let Some(router) = slot.upgrade()
+        if let Some(router) = slot.router.upgrade()
             && router.add_route(serial_no, Arc::clone(&alive), Arc::clone(&fanout))
         {
             return Ok(router);
@@ -906,14 +947,82 @@ impl Bus {
 
         // None running, or the old one is shutting down: start fresh with this
         // route already in place so the worker never sees an empty table.
+        //
+        // It listens on the output handle from the last DS4 plug, which holds
+        // what the host has sent since then. If there is none (opening it
+        // failed at plug), open one now: that loses this pad's earlier output,
+        // but cannot replay another pad's.
+        let listen_on = if let Some(handle) = &slot.handle {
+            Arc::clone(handle)
+        } else if let Some(opened) = self.open_ds4_output_handle() {
+            let handle = opened?;
+            slot.handle = Some(Arc::clone(&handle));
+            handle
+        } else {
+            // No device path (unit tests): the main handle. Not stored in the
+            // slot, which would make `BusInner` own itself.
+            Arc::clone(&self.inner)
+        };
         let core = Arc::new(RouterCore::default());
         let inserted = core.insert(serial_no, alive, fanout);
         debug_assert!(inserted, "fresh router core must accept a route");
-        let worker =
-            self.spawn_notification_thread::<Ds4OutputWorker, _>(None, Arc::clone(&core))?;
+        let worker = Self::spawn_notification_thread_on::<Ds4OutputWorker, _>(
+            listen_on,
+            None,
+            Arc::clone(&core),
+        )?;
         let router = Arc::new(Ds4OutputRouter::new(core, worker));
-        *slot = Arc::downgrade(&router);
+        slot.router = Arc::downgrade(&router);
         Ok(router)
+    }
+
+    #[cfg(feature = "ds4")]
+    fn lock_ds4_output(&self) -> std::sync::MutexGuard<'_, Ds4OutputSlot> {
+        self.inner
+            .ds4_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Open another handle to this bus device for the DS4 output listener.
+    ///
+    /// `None` if this bus has no recorded device path (unit tests).
+    #[cfg(feature = "ds4")]
+    fn open_ds4_output_handle(&self) -> Option<Result<Arc<BusInner>, BusError>> {
+        let path = self.inner.device_path.as_deref()?;
+        Some((|| {
+            let handle = open_device(path).map_err(map_ioctl(Operation::OPEN_BUS, None))?;
+            let inner = Arc::new(BusInner::new(handle));
+            check_version(&inner).map_err(map_ioctl(Operation::CHECK_VERSION, None))?;
+            Ok(inner)
+        })())
+    }
+
+    /// Throw away DS4 output reports the driver has queued for this client.
+    /// Called just before a DS4 pad is plugged.
+    ///
+    /// ViGEmBus keeps the newest 64 DS4 output reports per open bus handle,
+    /// from every DS4 pad on the machine, whether or not a request is waiting,
+    /// and does not clear them when a pad is unplugged. Reports carry only the
+    /// pad's serial, so a new pad on a reused serial would receive the previous
+    /// pad's reports on its first raw subscription (measured on 1.21.442; see
+    /// `ds4_output_router`). The driver has no call to clear that queue, but a
+    /// newly opened handle starts with an empty one, so the listener's handle
+    /// is replaced here.
+    ///
+    /// Skipped while a router is running: it reads continuously and drops
+    /// reports for pads without a route, so its handle's queue is empty, and
+    /// the subscribed pads must keep their handle. If opening fails, the slot
+    /// is left empty and the next subscription opens a handle itself.
+    #[cfg(feature = "ds4")]
+    fn discard_stale_ds4_output(&self) {
+        let mut slot = self.lock_ds4_output();
+        if slot.router.upgrade().is_some_and(|r| !r.is_closed()) {
+            return;
+        }
+        // Drop the old handle first; its queue goes with it.
+        slot.handle = None;
+        slot.handle = self.open_ds4_output_handle().and_then(Result::ok);
     }
 
     #[cfg(feature = "x360")]
@@ -1042,7 +1151,7 @@ mod tests {
         windows::core::Error::from(windows::Win32::Foundation::WIN32_ERROR(code))
     }
 
-    /// F6(a): which `WAIT_DEVICE_READY` failures keep the pad as `Unknown`.
+    /// Which `WAIT_DEVICE_READY` failures keep the pad as `Unknown`.
     #[test]
     fn wait_device_ready_errors_that_keep_the_pad() {
         for (code, keep) in [
@@ -1064,7 +1173,7 @@ mod tests {
         }
     }
 
-    /// F6(b): only our own wait timeout triggers the cleanup unplug.
+    /// Only our own wait timeout triggers the cleanup unplug.
     #[test]
     fn local_ioctl_timeout_is_error_timeout_only() {
         assert!(is_local_ioctl_timeout(&windows::core::Error::new(

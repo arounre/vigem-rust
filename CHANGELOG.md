@@ -28,6 +28,14 @@ All notable changes to this project are documented here. The format is based on
   Now one listener per `Client` routes each report by its serial, matching upstream ViGEmClient.
   Reports for other pads and other processes are discarded. No API change. The typed
   `register_notification` stream was not affected.
+- **A new DS4 pad could receive a previous pad's raw output reports.** ViGEmBus keeps the newest
+  64 DS4 output reports per open bus handle and does not clear them when a pad is unplugged. They
+  carry only the pad's serial, so the first `register_notification_raw_buffer` subscriber on a new
+  pad got whatever had been sent to an earlier pad with the same serial (yours or another
+  process's), for example an old "rumble on". The raw-output listener now uses its own bus handle,
+  which is replaced by a newly opened (empty) one just before each DS4 plug. Output the host sent
+  to the pad itself before you subscribed is still delivered, except when another DS4 pad of the
+  same `Client` was subscribed or plugged in the meantime.
 - **Xbox 360 `wait_for_ready` did not check anything.** It sent all-zero reports and waited for
   three to succeed, but the driver accepts an unchanged report without touching the device, and a
   new pad's last report is all zeroes. So the check always passed. On drivers that implement

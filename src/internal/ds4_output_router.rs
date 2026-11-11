@@ -6,6 +6,49 @@
 //! originating pad's serial. So there is exactly one await-output worker per
 //! bus handle, and it routes each completion to the pad it names. Reports for
 //! serials with no route (other pads, other processes) are dropped.
+//!
+//! # The driver's per-handle output queue
+//!
+//! Measured on ViGEmBus 1.21.442 (hidapi writing tagged output reports to a
+//! virtual DS4 pad). Do not simplify the handling below without repeating
+//! these measurements.
+//!
+//! - Every open bus handle gets its own copy of every DS4 output report
+//!   written while it is open, from any pad of any process, **whether or not
+//!   a request is waiting on it**. The driver keeps the newest 64 per handle
+//!   (write 100 with nobody listening, and the next 64 requests return the
+//!   last 64 at once).
+//! - The queue is **not cleared when a pad is unplugged**. A report carries
+//!   only its pad's serial, so after "pad 1 on serial N gets output, is
+//!   unplugged, pad 2 is plugged on serial N", a listener on that handle
+//!   receives pad 1's reports as pad 2's.
+//! - There is no IOCTL to clear the queue. A handle opened later starts
+//!   empty, and closing a handle discards its queue.
+//! - Host software writes to every new DS4 pad without any game running
+//!   (about 5 reports in the first second with Steam and `GameInput`
+//!   installed), so the queue is rarely empty.
+//!
+//! What this crate does about it:
+//!
+//! - The router listens on **its own bus handle**, not the client's main one
+//!   (`Ds4OutputSlot`). The main handle's queue fills up and is never read.
+//! - Just before each DS4 plug, if no router is running, that handle is
+//!   replaced by a newly opened one (`Bus::discard_stale_ds4_output`). So the
+//!   queue a later subscription reads can only hold reports written after
+//!   the newest DS4 pad of this client was plugged, never a previous pad's.
+//! - While a router is running nothing accumulates: it reads continuously
+//!   and drops what has no route.
+//!
+//! What a subscriber therefore gets:
+//!
+//! - Output written to its pad before it subscribed is delivered (the host's
+//!   first lightbar and rumble state), **unless** a router was already
+//!   running for another pad at the time, or this client plugged another DS4
+//!   pad in between. Both discard it.
+//! - Never output written to an earlier pad that used the same serial.
+//!   Remaining gap: the handle is opened a moment before `PLUGIN_TARGET`, so
+//!   a report written to another process's pad on that serial in that moment,
+//!   followed by its unplug, would still get through.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,6 +211,11 @@ impl Ds4OutputRouter {
         fanout: Arc<Fanout<Ds4OutputBuffer>>,
     ) -> bool {
         self.core.insert(serial_no, alive, fanout)
+    }
+
+    /// The worker has stopped or is stopping; nothing reads its handle any more.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.core.lock().closed
     }
 }
 

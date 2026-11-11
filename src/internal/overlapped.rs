@@ -53,22 +53,43 @@ pub(crate) struct BusInner {
     /// (NUL-terminated UTF-16). `None` if it could not be read - serial
     /// discovery then degrades to [`crate::SerialDiscovery::Off`].
     pub(crate) devnode_id: Option<Vec<u16>>,
-    /// The one DS4 await-output router for this file handle (the driver queues
-    /// that IOCTL per file object, not per pad).
+    /// Device interface path this handle was opened with (NUL-terminated
+    /// UTF-16), kept so a second handle to the same bus device can be opened.
+    /// `None` on handles that are never reopened (and in unit tests).
     #[cfg(feature = "ds4")]
-    pub(crate) ds4_output_router:
-        std::sync::Mutex<std::sync::Weak<crate::internal::ds4_output_router::Ds4OutputRouter>>,
+    pub(crate) device_path: Option<Vec<u16>>,
+    /// DS4 raw-output listening state for the client that owns this handle.
+    #[cfg(feature = "ds4")]
+    pub(crate) ds4_output: std::sync::Mutex<Ds4OutputSlot>,
+}
+
+/// The DS4 await-output router and the bus handle it listens on.
+///
+/// The listener does not use the client's main handle. It has its own, which
+/// is replaced by a newly opened one at every DS4 plug while no router is
+/// running; see `ds4_output_router` for the driver behaviour behind this.
+#[cfg(feature = "ds4")]
+#[derive(Default)]
+pub(crate) struct Ds4OutputSlot {
+    /// The one router for this client (the driver queues the await-output
+    /// IOCTL per file object, not per pad).
+    pub(crate) router: std::sync::Weak<crate::internal::ds4_output_router::Ds4OutputRouter>,
+    /// Handle the current or next router listens on. `None` until the first
+    /// DS4 plug or raw subscription, or if opening it failed.
+    pub(crate) handle: Option<std::sync::Arc<BusInner>>,
 }
 
 impl BusInner {
-    /// No captured instance id.
+    /// No captured instance id or device path.
     #[inline]
     pub(crate) fn new(handle: HANDLE) -> Self {
         Self {
             handle,
             devnode_id: None,
             #[cfg(feature = "ds4")]
-            ds4_output_router: std::sync::Mutex::new(std::sync::Weak::new()),
+            device_path: None,
+            #[cfg(feature = "ds4")]
+            ds4_output: std::sync::Mutex::new(Ds4OutputSlot::default()),
         }
     }
 }
@@ -752,7 +773,7 @@ mod tests {
     };
     use windows::core::w;
 
-    /// `WAIT_FAILED` surfaces the thread's last error, not `ERROR_TIMEOUT` (F7).
+    /// `WAIT_FAILED` surfaces the thread's last error, not `ERROR_TIMEOUT`.
     #[test]
     fn wait_failure_error_reports_last_error() {
         // SAFETY: waiting on a null handle is defined to fail with
@@ -766,7 +787,7 @@ mod tests {
         );
     }
 
-    /// An unexpected status maps to `E_UNEXPECTED`, not `ERROR_TIMEOUT` (F7).
+    /// An unexpected status maps to `E_UNEXPECTED`, not `ERROR_TIMEOUT`.
     #[test]
     fn wait_failure_error_unexpected_status() {
         let err = wait_failure_error(WAIT_EVENT(0x80)); // WAIT_ABANDONED_0
