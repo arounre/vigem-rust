@@ -1,7 +1,7 @@
-//! Build an [`X360Report`](crate::X360Report), OR together
-//! [`X360Button`](crate::X360Button) flags, then
+//! Build an [`X360Report`], OR together
+//! [`X360Button`] flags, then
 //! [`TargetHandle::update`](crate::TargetHandle::update). For host feedback, see
-//! [`X360Notification`](crate::X360Notification).
+//! [`X360Notification`].
 
 use bitflags::bitflags;
 

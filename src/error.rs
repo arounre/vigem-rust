@@ -1,5 +1,5 @@
 //! Public APIs return [`ClientError`]. When the problem is the driver or a pad,
-//! match the nested [`BusError`]. [`NotificationReceiver`]
+//! match the nested [`BusError`]. [`NotificationReceiver`](crate::NotificationReceiver)
 //! uses [`RecvError`] / [`TryRecvError`] / [`RecvTimeoutError`].
 //!
 //! # What to do when things fail
@@ -382,11 +382,21 @@ pub enum BusError {
     /// The host has given this Xbox 360 pad an XInput slot, but the driver did
     /// not return its number.
     ///
-    /// Only from [`user_index`](crate::TargetHandle::user_index). Current
+    // The Xbox 360 items linked below only exist with the `x360` feature, so
+    // name them as plain code when it is off (the link would not resolve).
+    #[cfg_attr(
+        feature = "x360",
+        doc = "Only from [`user_index`](crate::TargetHandle::user_index). Current"
+    )]
+    #[cfg_attr(not(feature = "x360"), doc = "Only from `user_index`. Current")]
     /// ViGEmBus drivers (measured on 1.21.442) answer the query without any
     /// data, so the number cannot be read this way. It is not a fault and
     /// retrying does not help: read
-    /// [`X360Notification::led_number`](crate::X360Notification::led_number)
+    #[cfg_attr(
+        feature = "x360",
+        doc = "[`X360Notification::led_number`](crate::X360Notification::led_number)"
+    )]
+    #[cfg_attr(not(feature = "x360"), doc = "`X360Notification::led_number`")]
     /// from [`register_notification`](crate::TargetHandle::register_notification)
     /// instead.
     #[error("target {serial_no} has an XInput user index, but the driver did not return it")]

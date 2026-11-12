@@ -1,10 +1,10 @@
 //! | You want... | Use |
 //! |-----------|-----|
-//! | Buttons, sticks, triggers | [`Ds4Report`](crate::Ds4Report) + [`update`](crate::TargetHandle::update) |
-//! | Gyro, accel, touchpad | [`Ds4ReportEx`](crate::Ds4ReportEx) + [`update_ex`](crate::TargetHandle::update_ex) |
-//! | Easy touch tracking ids | [`TouchpadTracker`](crate::TouchpadTracker) |
-//! | Rumble + lightbar from games | [`Ds4Notification`](crate::Ds4Notification) via `register_notification` |
-//! | Full 64-byte host output | [`Ds4OutputBuffer`](crate::Ds4OutputBuffer) via `register_notification_raw_buffer` |
+//! | Buttons, sticks, triggers | [`Ds4Report`] + [`update`](crate::TargetHandle::update) |
+//! | Gyro, accel, touchpad | [`Ds4ReportEx`] + [`update_ex`](crate::TargetHandle::update_ex) |
+//! | Easy touch tracking ids | [`TouchpadTracker`] |
+//! | Rumble + lightbar from games | [`Ds4Notification`] via `register_notification` |
+//! | Full 64-byte host output | [`Ds4OutputBuffer`] via `register_notification_raw_buffer` |
 //!
 //! Face buttons: `report.buttons |= Ds4ButtonFlags::...`. D-pad:
 //! [`Ds4Report::set_dpad`](crate::Ds4Report::set_dpad).
@@ -1167,6 +1167,149 @@ const _: () = {
     assert!(align_of::<Ds4ReportExData>() == 1 && align_of::<Ds4Report>() == 2);
 };
 
+/// RGB lightbar color from the host ([`Ds4Notification::lightbar`]).
+///
+/// # Examples
+///
+/// ```
+/// use vigem_rust::Ds4LightbarColor;
+///
+/// let color = Ds4LightbarColor::new(255, 0, 128);
+/// assert_eq!(color.red, 255);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct Ds4LightbarColor {
+    /// Red (`0..=255`).
+    pub red: u8,
+    /// Green (`0..=255`).
+    pub green: u8,
+    /// Blue (`0..=255`).
+    pub blue: u8,
+}
+
+impl Ds4LightbarColor {
+    /// Build an RGB color.
+    ///
+    /// This type is `#[non_exhaustive]`; use this instead of a struct literal.
+    #[inline]
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            red: r,
+            green: g,
+            blue: b,
+        }
+    }
+}
+
+/// Host feedback for a DualShock 4: rumble and lightbar color.
+///
+/// From [`register_notification`](crate::TargetHandle::register_notification).
+///
+/// # Example
+///
+/// ```no_run
+/// # use vigem_rust::Client;
+/// # use std::error::Error;
+/// # fn main() -> Result<(), Box<dyn Error>> {
+/// # let client = Client::connect()?;
+/// # let ds4 = client.new_ds4_target().plug()?.wait_for_ready()?;
+/// let receiver = ds4.register_notification()?;
+/// if let Ok(n) = receiver.recv() {
+///     println!("rumble {}/{}  lightbar {:?}", n.large_motor, n.small_motor, n.lightbar);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct Ds4Notification {
+    /// Large motor strength (`0..=255`).
+    pub large_motor: u8,
+    /// Small motor strength (`0..=255`).
+    pub small_motor: u8,
+    /// Lightbar color requested by the host.
+    pub lightbar: Ds4LightbarColor,
+}
+
+impl Ds4Notification {
+    /// Build a notification.
+    ///
+    /// This type is `#[non_exhaustive]`, so this is the only way to construct
+    /// one outside this crate, useful for tests and replaying captures.
+    #[inline]
+    pub const fn new(large_motor: u8, small_motor: u8, lightbar: Ds4LightbarColor) -> Self {
+        Self {
+            large_motor,
+            small_motor,
+            lightbar,
+        }
+    }
+}
+
+/// Full 64-byte host output report for one DualShock 4.
+///
+/// From [`register_notification_raw_buffer`](crate::TargetHandle::register_notification_raw_buffer).
+/// If you only need rumble and lightbar, use [`Ds4Notification`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct Ds4OutputBuffer {
+    /// Raw output report bytes.
+    pub bytes: [u8; 64],
+}
+
+impl Ds4OutputBuffer {
+    /// Wrap a 64-byte payload.
+    ///
+    /// This type is `#[non_exhaustive]`; use this instead of a struct literal.
+    #[inline]
+    pub const fn new(bytes: [u8; 64]) -> Self {
+        Self { bytes }
+    }
+}
+
+// serde only derives `[T; N]` up through 32; the 64-byte host buffer needs a
+// tiny manual impl (still feature-gated). Round-trips as `{"bytes":[...64 bytes...]}`.
+#[cfg(feature = "serde")]
+impl Serialize for Ds4OutputBuffer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Helper<'a> {
+            bytes: &'a [u8],
+        }
+        Helper {
+            bytes: self.bytes.as_slice(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for Ds4OutputBuffer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Helper {
+            bytes: Vec<u8>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        let len = helper.bytes.len();
+        let bytes: [u8; 64] = helper.bytes.try_into().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "Ds4OutputBuffer.bytes: expected 64 bytes, got {len}"
+            ))
+        })?;
+        Ok(Self { bytes })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,148 +1586,5 @@ mod tests {
         assert!(!json.contains("\"buf\""), "{json}");
         let restored: Ds4OutputBuffer = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, buf);
-    }
-}
-
-/// RGB lightbar color from the host ([`Ds4Notification::lightbar`]).
-///
-/// # Examples
-///
-/// ```
-/// use vigem_rust::Ds4LightbarColor;
-///
-/// let color = Ds4LightbarColor::new(255, 0, 128);
-/// assert_eq!(color.red, 255);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[non_exhaustive]
-pub struct Ds4LightbarColor {
-    /// Red (`0..=255`).
-    pub red: u8,
-    /// Green (`0..=255`).
-    pub green: u8,
-    /// Blue (`0..=255`).
-    pub blue: u8,
-}
-
-impl Ds4LightbarColor {
-    /// Build an RGB color.
-    ///
-    /// This type is `#[non_exhaustive]`; use this instead of a struct literal.
-    #[inline]
-    pub const fn new(r: u8, g: u8, b: u8) -> Self {
-        Self {
-            red: r,
-            green: g,
-            blue: b,
-        }
-    }
-}
-
-/// Host feedback for a DualShock 4: rumble and lightbar color.
-///
-/// From [`register_notification`](crate::TargetHandle::register_notification).
-///
-/// # Example
-///
-/// ```no_run
-/// # use vigem_rust::Client;
-/// # use std::error::Error;
-/// # fn main() -> Result<(), Box<dyn Error>> {
-/// # let client = Client::connect()?;
-/// # let ds4 = client.new_ds4_target().plug()?.wait_for_ready()?;
-/// let receiver = ds4.register_notification()?;
-/// if let Ok(n) = receiver.recv() {
-///     println!("rumble {}/{}  lightbar {:?}", n.large_motor, n.small_motor, n.lightbar);
-/// }
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[non_exhaustive]
-pub struct Ds4Notification {
-    /// Large motor strength (`0..=255`).
-    pub large_motor: u8,
-    /// Small motor strength (`0..=255`).
-    pub small_motor: u8,
-    /// Lightbar color requested by the host.
-    pub lightbar: Ds4LightbarColor,
-}
-
-impl Ds4Notification {
-    /// Build a notification.
-    ///
-    /// This type is `#[non_exhaustive]`, so this is the only way to construct
-    /// one outside this crate, useful for tests and replaying captures.
-    #[inline]
-    pub const fn new(large_motor: u8, small_motor: u8, lightbar: Ds4LightbarColor) -> Self {
-        Self {
-            large_motor,
-            small_motor,
-            lightbar,
-        }
-    }
-}
-
-/// Full 64-byte host output report for one DualShock 4.
-///
-/// From [`register_notification_raw_buffer`](crate::TargetHandle::register_notification_raw_buffer).
-/// If you only need rumble and lightbar, use [`Ds4Notification`] instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub struct Ds4OutputBuffer {
-    /// Raw output report bytes.
-    pub bytes: [u8; 64],
-}
-
-impl Ds4OutputBuffer {
-    /// Wrap a 64-byte payload.
-    ///
-    /// This type is `#[non_exhaustive]`; use this instead of a struct literal.
-    #[inline]
-    pub const fn new(bytes: [u8; 64]) -> Self {
-        Self { bytes }
-    }
-}
-
-// serde only derives `[T; N]` up through 32; the 64-byte host buffer needs a
-// tiny manual impl (still feature-gated). Round-trips as `{"bytes":[...64 bytes...]}`.
-#[cfg(feature = "serde")]
-impl Serialize for Ds4OutputBuffer {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(Serialize)]
-        struct Helper<'a> {
-            bytes: &'a [u8],
-        }
-        Helper {
-            bytes: self.bytes.as_slice(),
-        }
-        .serialize(serializer)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> Deserialize<'de> for Ds4OutputBuffer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Helper {
-            bytes: Vec<u8>,
-        }
-        let helper = Helper::deserialize(deserializer)?;
-        let len = helper.bytes.len();
-        let bytes: [u8; 64] = helper.bytes.try_into().map_err(|_| {
-            serde::de::Error::custom(format!(
-                "Ds4OutputBuffer.bytes: expected 64 bytes, got {len}"
-            ))
-        })?;
-        Ok(Self { bytes })
     }
 }
