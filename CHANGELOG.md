@@ -36,6 +36,11 @@ All notable changes to this project are documented here. The format is based on
   which is replaced by a newly opened (empty) one just before each DS4 plug. Output the host sent
   to the pad itself before you subscribed is still delivered, except when another DS4 pad of the
   same `Client` was subscribed or plugged in the meantime.
+- **A new notification subscription could be disconnected at once.** If the last
+  `NotificationReceiver` of a pad was dropped, a notification arrived, and another thread called
+  `register_notification` at that moment, the new receiver could be attached to the listener that
+  was just stopping and report `Disconnected` on a pad that was still plugged in. Such a
+  registration now starts a new listener.
 - **Xbox 360 `wait_for_ready` did not check anything.** It sent all-zero reports and waited for
   three to succeed, but the driver accepts an unchanged report without touching the device, and a
   new pad's last report is all zeroes. So the check always passed. On drivers that implement

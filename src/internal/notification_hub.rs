@@ -64,10 +64,18 @@ impl<N> Fanout<N> {
 
 impl<N: Clone> Fanout<N> {
     /// Deliver to every subscriber. `false` => nobody left, worker should stop.
+    ///
+    /// Returning `false` also closes the fan-out, under the same lock
+    /// `subscribe` takes. Otherwise a subscriber could attach between this
+    /// call and the stopping worker's `close`, and be disconnected at once.
     pub(crate) fn deliver(&self, item: Result<N, BusError>) -> bool {
         let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
         subs.retain(|s| s.tx.send(item.clone()).is_ok());
-        !subs.is_empty()
+        if subs.is_empty() {
+            self.closed.store(true, Ordering::Release);
+            return false;
+        }
+        true
     }
 }
 
@@ -201,6 +209,25 @@ mod tests {
             Err(RecvTimeoutError::Disconnected)
         ));
         assert!(fanout.subscribe(NotificationBuffer::default()).is_none());
+    }
+
+    /// A delivery that finds nobody ends the fan-out at that moment. A
+    /// subscriber arriving after it, but before the worker has exited and
+    /// called `close`, is refused (the caller then starts a new hub) instead
+    /// of being attached to a worker that is about to disconnect it.
+    #[test]
+    fn delivery_to_nobody_refuses_later_subscribers() {
+        let fanout = Fanout::<u32>::new();
+        let (id, _rx) = fanout
+            .subscribe(NotificationBuffer::Unbounded)
+            .expect("open");
+        fanout.unsubscribe(id);
+
+        assert!(!fanout.deliver(Ok(1)), "nobody left: worker stops");
+        assert!(
+            fanout.subscribe(NotificationBuffer::default()).is_none(),
+            "must not attach to a fan-out whose worker is stopping"
+        );
     }
 
     #[test]
