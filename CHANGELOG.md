@@ -41,6 +41,10 @@ All notable changes to this project are documented here. The format is based on
   `register_notification` at that moment, the new receiver could be attached to the listener that
   was just stopping and report `Disconnected` on a pad that was still plugged in. Such a
   registration now starts a new listener.
+- **`update` could send a report after the pad was unplugged.** A call that waited for another
+  clone's `update` on the same pad checked that the pad was plugged in only before waiting. If the
+  pad was unplugged meanwhile, the report was still sent to its serial, which another pad may have
+  taken over. The check is now repeated after the wait.
 - **Xbox 360 `wait_for_ready` did not check anything.** It sent all-zero reports and waited for
   three to succeed, but the driver accepts an unchanged report without touching the device, and a
   new pad's last report is all zeroes. So the check always passed. On drivers that implement

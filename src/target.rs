@@ -490,6 +490,9 @@ impl<T: Device, S> TargetHandle<T, S> {
         f: impl FnOnce(&mut OverlappedCall) -> Result<R, BusError>,
     ) -> Result<R, ClientError> {
         let mut guard = self.inner.submit.lock().unwrap_or_else(|e| e.into_inner());
+        // Checked again here: the pad may have been unplugged (and its serial
+        // given to another pad) while this call waited for the lock.
+        self.assert_alive_hot()?;
         if guard.as_ref().is_some_and(OverlappedCall::is_poisoned) {
             let _ = guard.take();
         }
@@ -2075,5 +2078,43 @@ mod tests {
 
         let default = pad.register_notification().expect("default");
         assert_eq!(default.capacity(), Some(NOTIFICATION_CHANNEL_CAPACITY));
+    }
+
+    /// An `update` that waited behind another clone's submit must notice an
+    /// unplug that happened while it waited, and not send to the serial (which
+    /// may belong to another pad by then).
+    ///
+    /// The sleep only has to be long enough for the waiter to reach the lock.
+    /// If it is not, the waiter sees the unplug at its first check and the
+    /// test passes anyway, so it cannot fail spuriously.
+    #[test]
+    #[cfg(feature = "x360")]
+    fn update_blocked_on_submit_lock_sees_unplug() {
+        let client = Client::null_for_tests(4);
+        let pad = client
+            .plugin_internal_with::<Xbox360, _>(test_spec(), |_, _, _| Ok(PlugReadiness::Confirmed))
+            .expect("plug")
+            .assume_ready();
+
+        // Stand in for another clone's submit in flight.
+        let in_flight = pad.inner.submit.lock().expect("submit lock");
+        let waiter = {
+            let pad = pad.clone();
+            thread::spawn(move || pad.update(&X360Report::default()))
+        };
+        thread::sleep(Duration::from_millis(200));
+
+        // Null bus: the unplug IOCTL fails, but the pad is gone for the client.
+        let _ = pad.unplug();
+        drop(in_flight);
+
+        let err = waiter
+            .join()
+            .expect("waiter thread")
+            .expect_err("update after unplug must fail");
+        assert!(
+            matches!(err, ClientError::TargetDoesNotExist { .. }),
+            "expected TargetDoesNotExist without touching the bus, got {err:?}"
+        );
     }
 }
