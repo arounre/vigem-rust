@@ -43,7 +43,7 @@ pub(crate) fn occupied_serials(devnode_id: &[u16]) -> Result<HashSet<u32>, BusEr
 
     let mut bus: u32 = 0;
     // SAFETY: `devnode_id` is NUL-terminated UTF-16 owned by the caller (or a
-    // clone of the id stored on `BusInner` at connect).
+    // clone of the id stored on the `Bus` at connect).
     let cr = unsafe {
         CM_Locate_DevNodeW(
             &raw mut bus,

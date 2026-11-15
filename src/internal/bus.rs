@@ -37,10 +37,8 @@ use crate::controller::x360::{X360Notification, X360Report, XusbSubmitReport};
 use crate::error::{BusError, Operation, Win32Error};
 use crate::internal::ioctl::*;
 use crate::internal::notification_workers::*;
-#[cfg(feature = "ds4")]
-use crate::internal::overlapped::Ds4OutputSlot;
 use crate::internal::overlapped::{
-    BusInner, IOCTL_TEARDOWN_TIMEOUT_MS, IoctlBuffers, OverlappedCall, WAIT_POLL_MS,
+    BusHandle, IOCTL_TEARDOWN_TIMEOUT_MS, IoctlBuffers, OverlappedCall, WAIT_POLL_MS,
     ensure_full_transfer,
 };
 use crate::target::Target;
@@ -148,7 +146,7 @@ fn open_device(path: &[u16]) -> windows::core::Result<windows::Win32::Foundation
 }
 
 /// Send `CHECK_VERSION` on a newly opened handle.
-fn check_version(bus: &Arc<BusInner>) -> windows::core::Result<()> {
+fn check_version(bus: &Arc<BusHandle>) -> windows::core::Result<()> {
     let version = CheckVersion {
         size: wire_size_of::<CheckVersion>(),
         version: VIGEM_COMMON_VERSION,
@@ -167,12 +165,78 @@ fn check_version(bus: &Arc<BusInner>) -> windows::core::Result<()> {
     .map(|_| ())
 }
 
+/// One client's connection to ViGEmBus. Clones share the same state.
 #[derive(Clone)]
 pub(crate) struct Bus {
-    pub(crate) inner: Arc<BusInner>,
+    inner: Arc<BusShared>,
+}
+
+struct BusShared {
+    /// The client's main handle: plug, unplug, reports, per-pad notifications.
+    handle: Arc<BusHandle>,
+    /// Instance id of the ViGEmBus device node `handle` was opened on
+    /// (NUL-terminated UTF-16). `None` if it could not be read - serial
+    /// discovery then degrades to [`crate::SerialDiscovery::Off`].
+    devnode_id: Option<Vec<u16>>,
+    /// Device interface path `handle` was opened with (NUL-terminated UTF-16),
+    /// kept so a second handle to the same bus device can be opened.
+    /// `None` only in unit tests.
+    #[cfg(feature = "ds4")]
+    device_path: Option<Vec<u16>>,
+    #[cfg(feature = "ds4")]
+    ds4_output: Mutex<Ds4OutputSlot>,
+}
+
+/// The DS4 await-output router and the bus handle it listens on.
+///
+/// The listener does not use the client's main handle. It has its own, which
+/// is replaced by a newly opened one at every DS4 plug while no router is
+/// running; see `ds4_output_router` for the driver behaviour behind this.
+#[cfg(feature = "ds4")]
+#[derive(Default)]
+struct Ds4OutputSlot {
+    /// The one router for this client (the driver queues the await-output
+    /// IOCTL per file object, not per pad).
+    router: std::sync::Weak<Ds4OutputRouter>,
+    /// Handle the current or next router listens on. `None` until the first
+    /// DS4 plug or raw subscription, or if opening it failed.
+    handle: Option<Arc<BusHandle>>,
 }
 
 impl Bus {
+    fn new(
+        handle: Arc<BusHandle>,
+        devnode_id: Option<Vec<u16>>,
+        #[cfg_attr(not(feature = "ds4"), allow(unused_variables))] device_path: Option<Vec<u16>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(BusShared {
+                handle,
+                devnode_id,
+                #[cfg(feature = "ds4")]
+                device_path,
+                #[cfg(feature = "ds4")]
+                ds4_output: Mutex::new(Ds4OutputSlot::default()),
+            }),
+        }
+    }
+
+    /// Driver-free bus with a null handle and no device path.
+    #[cfg(test)]
+    pub(crate) fn null_for_tests() -> Self {
+        Self::new(
+            Arc::new(BusHandle::new(windows::Win32::Foundation::HANDLE::default())),
+            None,
+            None,
+        )
+    }
+
+    /// The main handle, for calls that keep the device open across an IOCTL.
+    #[inline]
+    pub(crate) fn handle(&self) -> &Arc<BusHandle> {
+        &self.inner.handle
+    }
+
     /// For serial discovery so the PnP walk can run without holding the client mutex.
     #[inline]
     pub(crate) fn devnode_id_cloned(&self) -> Option<Vec<u16>> {
@@ -198,10 +262,10 @@ struct WorkerSlot {
     overlapped: Option<SendOverlappedPtr>,
 }
 
-/// Shared by the notification worker and its handle (`Arc<BusInner>` for cancel).
+/// Shared by the notification worker and its handle (`Arc<BusHandle>` for cancel).
 struct WorkerState {
     slot: Mutex<WorkerSlot>,
-    bus: Arc<BusInner>,
+    bus: Arc<BusHandle>,
 }
 
 /// Slot mutex; recover from poison so Drop can always join.
@@ -225,7 +289,7 @@ impl Drop for NotificationWorkerHandle {
                 && !ptr.is_null()
             {
                 // SAFETY: `state.bus` keeps the device handle open (only
-                // BusInner::drop closes it). `ptr` is the worker's live OVERLAPPED;
+                // BusHandle::drop closes it). `ptr` is the worker's live OVERLAPPED;
                 // the worker cannot free it while we hold the slot lock.
                 unsafe {
                     let _ = CancelIoEx(self.state.bus.handle, Some(ptr));
@@ -465,21 +529,14 @@ impl Bus {
             };
 
             // Wrap immediately so the version-check IOCTL can hold Arc like every other call.
-            let mut candidate = Arc::new(BusInner::new(handle));
+            let candidate = Arc::new(BusHandle::new(handle));
 
             match check_version(&candidate) {
                 Ok(()) => {
-                    // Sole owner of the Arc - get_mut succeeds.
-                    if let Some(inner) = Arc::get_mut(&mut candidate) {
-                        // Best-effort: failure degrades serial discovery to Off.
-                        inner.devnode_id =
-                            crate::internal::devnode::read_device_instance_id(devinfo.DevInst).ok();
-                        #[cfg(feature = "ds4")]
-                        {
-                            inner.device_path = Some(device_path);
-                        }
-                    }
-                    return Ok(Bus { inner: candidate });
+                    // Best-effort: failure degrades serial discovery to Off.
+                    let devnode_id =
+                        crate::internal::devnode::read_device_instance_id(devinfo.DevInst).ok();
+                    return Ok(Bus::new(candidate, devnode_id, Some(device_path)));
                 }
                 Err(e) => {
                     let e = Win32Error::from(e);
@@ -526,7 +583,7 @@ impl Bus {
         // SAFETY: stack-local input; no output.
         let plugin_result = unsafe {
             OverlappedCall::ioctl_sync(
-                &self.inner,
+                self.handle(),
                 IOCTL_VIGEM_PLUGIN_TARGET,
                 core::ptr::from_ref(&plugin).cast::<c_void>(),
                 plugin.size,
@@ -556,7 +613,7 @@ impl Bus {
         // SAFETY: stack-local input; no output.
         let wait_result = unsafe {
             OverlappedCall::ioctl_sync(
-                &self.inner,
+                self.handle(),
                 IOCTL_VIGEM_WAIT_DEVICE_READY,
                 core::ptr::from_ref(&wait_ready).cast::<c_void>(),
                 wait_ready.size,
@@ -590,7 +647,7 @@ impl Bus {
         // SAFETY: stack-local input; no output. Teardown-bounded so Drop cannot hang.
         unsafe {
             OverlappedCall::ioctl_sync_timeout(
-                &self.inner,
+                self.handle(),
                 IOCTL_VIGEM_UNPLUG_TARGET,
                 core::ptr::from_ref(&unplug).cast::<c_void>(),
                 unplug.size,
@@ -635,7 +692,7 @@ impl Bus {
     /// One-shot submit (allocates event) for tests without a handle.
     #[cfg(all(test, feature = "x360"))]
     pub(crate) fn update_x360(&self, serial_no: u32, report: &X360Report) -> Result<(), BusError> {
-        let mut call = OverlappedCall::new(Arc::clone(&self.inner))
+        let mut call = OverlappedCall::new(Arc::clone(self.handle()))
             .map_err(map_ioctl(Operation::CREATE_EVENT_W, Some(serial_no)))?;
         self.update_x360_on(&mut call, serial_no, report)
     }
@@ -706,13 +763,13 @@ impl Bus {
         W: NotificationWorker,
         S: NotificationSink<W::Notification>,
     {
-        Self::spawn_notification_thread_on::<W, S>(Arc::clone(&self.inner), serial_no, sink)
+        Self::spawn_notification_thread_on::<W, S>(Arc::clone(self.handle()), serial_no, sink)
     }
 
     /// [`spawn_notification_thread`](Self::spawn_notification_thread) on an
     /// explicit bus handle.
     fn spawn_notification_thread_on<W, S>(
-        bus: Arc<BusInner>,
+        bus: Arc<BusHandle>,
         serial_no: Option<u32>,
         sink: S,
     ) -> Result<NotificationWorkerHandle, BusError>
@@ -960,8 +1017,8 @@ impl Bus {
             handle
         } else {
             // No device path (unit tests): the main handle. Not stored in the
-            // slot, which would make `BusInner` own itself.
-            Arc::clone(&self.inner)
+            // slot, which holds only handles opened for the listener.
+            Arc::clone(self.handle())
         };
         let core = Arc::new(RouterCore::default());
         let inserted = core.insert(serial_no, alive, fanout);
@@ -988,11 +1045,11 @@ impl Bus {
     ///
     /// `None` if this bus has no recorded device path (unit tests).
     #[cfg(feature = "ds4")]
-    fn open_ds4_output_handle(&self) -> Option<Result<Arc<BusInner>, BusError>> {
+    fn open_ds4_output_handle(&self) -> Option<Result<Arc<BusHandle>, BusError>> {
         let path = self.inner.device_path.as_deref()?;
         Some((|| {
             let handle = open_device(path).map_err(map_ioctl(Operation::OPEN_BUS, None))?;
-            let inner = Arc::new(BusInner::new(handle));
+            let inner = Arc::new(BusHandle::new(handle));
             check_version(&inner).map_err(map_ioctl(Operation::CHECK_VERSION, None))?;
             Ok(inner)
         })())
@@ -1037,7 +1094,7 @@ impl Bus {
         // Separate in/out buffers - no aliasing through one object.
         let size = wire_size_of::<XusbGetUserIndex>();
         let mut io = IoctlBuffers::new(
-            Arc::clone(&self.inner),
+            Arc::clone(self.handle()),
             Box::new(XusbGetUserIndex {
                 size,
                 serial_no,

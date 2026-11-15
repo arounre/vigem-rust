@@ -497,7 +497,7 @@ impl<T: Device, S> TargetHandle<T, S> {
             let _ = guard.take();
         }
         if guard.is_none() {
-            let call = OverlappedCall::new(Arc::clone(&self.inner.bus.inner)).map_err(|e| {
+            let call = OverlappedCall::new(Arc::clone(self.inner.bus.handle())).map_err(|e| {
                 BusError::from_ioctl(Operation::CREATE_EVENT_W, Some(self.inner.serial_no), e)
             })?;
             *guard = Some(call);

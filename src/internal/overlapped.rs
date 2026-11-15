@@ -47,54 +47,18 @@ enum DrainOutcome {
 }
 
 /// ViGEmBus device handle; closed when the last `Arc` drops.
-pub(crate) struct BusInner {
+pub(crate) struct BusHandle {
     pub(crate) handle: HANDLE,
-    /// Instance id of the ViGEmBus device node this handle was opened on
-    /// (NUL-terminated UTF-16). `None` if it could not be read - serial
-    /// discovery then degrades to [`crate::SerialDiscovery::Off`].
-    pub(crate) devnode_id: Option<Vec<u16>>,
-    /// Device interface path this handle was opened with (NUL-terminated
-    /// UTF-16), kept so a second handle to the same bus device can be opened.
-    /// `None` on handles that are never reopened (and in unit tests).
-    #[cfg(feature = "ds4")]
-    pub(crate) device_path: Option<Vec<u16>>,
-    /// DS4 raw-output listening state for the client that owns this handle.
-    #[cfg(feature = "ds4")]
-    pub(crate) ds4_output: std::sync::Mutex<Ds4OutputSlot>,
 }
 
-/// The DS4 await-output router and the bus handle it listens on.
-///
-/// The listener does not use the client's main handle. It has its own, which
-/// is replaced by a newly opened one at every DS4 plug while no router is
-/// running; see `ds4_output_router` for the driver behaviour behind this.
-#[cfg(feature = "ds4")]
-#[derive(Default)]
-pub(crate) struct Ds4OutputSlot {
-    /// The one router for this client (the driver queues the await-output
-    /// IOCTL per file object, not per pad).
-    pub(crate) router: std::sync::Weak<crate::internal::ds4_output_router::Ds4OutputRouter>,
-    /// Handle the current or next router listens on. `None` until the first
-    /// DS4 plug or raw subscription, or if opening it failed.
-    pub(crate) handle: Option<std::sync::Arc<BusInner>>,
-}
-
-impl BusInner {
-    /// No captured instance id or device path.
+impl BusHandle {
     #[inline]
     pub(crate) fn new(handle: HANDLE) -> Self {
-        Self {
-            handle,
-            devnode_id: None,
-            #[cfg(feature = "ds4")]
-            device_path: None,
-            #[cfg(feature = "ds4")]
-            ds4_output: std::sync::Mutex::new(Ds4OutputSlot::default()),
-        }
+        Self { handle }
     }
 }
 
-impl Drop for BusInner {
+impl Drop for BusHandle {
     fn drop(&mut self) {
         // SAFETY: sole closer of this handle.
         unsafe {
@@ -104,9 +68,9 @@ impl Drop for BusInner {
 }
 
 // SAFETY: Win32 HANDLEs have no thread affinity; concurrent DeviceIoControl is fine.
-unsafe impl Send for BusInner {}
+unsafe impl Send for BusHandle {}
 // SAFETY: same as Send.
-unsafe impl Sync for BusInner {}
+unsafe impl Sync for BusHandle {}
 
 /// Storage the I/O manager may write into after submission.
 ///
@@ -124,7 +88,7 @@ struct KernelOwned {
 /// - Do not move while `pending` (kernel holds a pointer into the boxed I/O block).
 /// - Use raw pointers into Win32; never reborrow the I/O block while an IRP may reference it.
 /// - Drop drains with a bounded wait. On timeout the event handle, the boxed I/O
-///   block, *and* the `Arc<BusInner>` are intentionally leaked so the device handle
+///   block, *and* the `Arc<BusHandle>` are intentionally leaked so the device handle
 ///   cannot be closed under a live IRP; the call is poisoned and never reused.
 /// - Callers that pass their own input/output buffers must leak those buffers too
 ///   when poisoned. Prefer [`IoctlBuffers`], which owns the call + both boxes and
@@ -133,7 +97,7 @@ struct KernelOwned {
 pub(crate) struct OverlappedCall {
     io: ManuallyDrop<Box<KernelOwned>>,
     /// Leaked with `io` when poisoned.
-    bus: ManuallyDrop<Arc<BusInner>>,
+    bus: ManuallyDrop<Arc<BusHandle>>,
     pending: bool,
     /// Drain timed out; never close or reuse the event.
     leak_event: bool,
@@ -144,7 +108,7 @@ pub(crate) struct OverlappedCall {
 unsafe impl Send for OverlappedCall {}
 
 impl OverlappedCall {
-    pub(crate) fn new(bus: Arc<BusInner>) -> windows::core::Result<Self> {
+    pub(crate) fn new(bus: Arc<BusHandle>) -> windows::core::Result<Self> {
         // SAFETY: unnamed auto-reset event; failure becomes Err.
         let h_event = unsafe { CreateEventW(None, false, false, None)? };
         Ok(Self {
@@ -414,7 +378,7 @@ impl OverlappedCall {
     /// Same buffer requirements as [`ioctl_timeout`](Self::ioctl_timeout). Prefer
     /// null `output` unless the caller can observe poison another way.
     pub(crate) unsafe fn ioctl_sync_timeout(
-        bus: &Arc<BusInner>,
+        bus: &Arc<BusHandle>,
         code: u32,
         input: *const c_void,
         in_len: u32,
@@ -432,7 +396,7 @@ impl OverlappedCall {
     /// # Safety
     /// Same as [`ioctl_sync_timeout`](Self::ioctl_sync_timeout).
     pub(crate) unsafe fn ioctl_sync(
-        bus: &Arc<BusInner>,
+        bus: &Arc<BusHandle>,
         code: u32,
         input: *const c_void,
         in_len: u32,
@@ -676,7 +640,7 @@ pub(crate) struct IoctlBuffers<T> {
 
 impl<T> IoctlBuffers<T> {
     pub(crate) fn new(
-        bus: Arc<BusInner>,
+        bus: Arc<BusHandle>,
         request: Box<T>,
         response: Box<T>,
     ) -> windows::core::Result<Self> {
@@ -814,7 +778,7 @@ mod tests {
 
     #[test]
     fn ioctl_buffers_finish_and_drop_without_pending_free_boxes() {
-        let bus = Arc::new(BusInner::new(HANDLE::default()));
+        let bus = Arc::new(BusHandle::new(HANDLE::default()));
         let mut io = IoctlBuffers::new(Arc::clone(&bus), Box::new(1u32), Box::new(2u32))
             .expect("CreateEventW");
         assert_eq!(*io.response(), 2);
@@ -834,7 +798,7 @@ mod tests {
 
     #[test]
     fn reset_preserves_event_handle_and_clears_state() {
-        let bus = Arc::new(BusInner::new(HANDLE::default()));
+        let bus = Arc::new(BusHandle::new(HANDLE::default()));
         let mut call = OverlappedCall::new(bus).expect("CreateEventW should succeed");
         let event = call.io.overlapped.hEvent;
         call.io.transferred = 42;
@@ -853,7 +817,7 @@ mod tests {
 
     #[test]
     fn irp_completed_tracks_status_pending_in_internal() {
-        let bus = Arc::new(BusInner::new(HANDLE::default()));
+        let bus = Arc::new(BusHandle::new(HANDLE::default()));
         let mut call = OverlappedCall::new(bus).expect("CreateEventW");
         // Fresh OVERLAPPED has Internal == 0 from Default - already "completed"
         // from the HasOverlappedIoCompleted perspective (not STATUS_PENDING).
@@ -871,7 +835,7 @@ mod tests {
     #[test]
     fn wait_cancellable_abort_leaves_pending_when_incomplete() {
         let handle = open_nul_overlapped();
-        let bus = Arc::new(BusInner::new(handle));
+        let bus = Arc::new(BusHandle::new(handle));
         let mut call = OverlappedCall::new(bus).expect("CreateEventW");
         call.pending = true;
         call.io.overlapped.Internal = STATUS_PENDING;
@@ -893,7 +857,7 @@ mod tests {
     #[test]
     fn pending_cleared_when_irp_completed_with_failure() {
         let handle = open_nul_overlapped();
-        let bus = Arc::new(BusInner::new(handle));
+        let bus = Arc::new(BusHandle::new(handle));
         let mut call = OverlappedCall::new(bus).expect("CreateEventW");
 
         call.pending = true;
@@ -923,7 +887,7 @@ mod tests {
     #[test]
     fn drain_not_found_with_completed_irp_returns_immediately() {
         let handle = open_nul_overlapped();
-        let bus = Arc::new(BusInner::new(handle));
+        let bus = Arc::new(BusHandle::new(handle));
         let mut call = OverlappedCall::new(bus).expect("CreateEventW");
 
         // Stale pending + completed Internal, no IRP actually queued.
@@ -956,7 +920,7 @@ mod tests {
     fn timed_out_drain_poisons_all_entry_points() {
         // --- reset: drain timeout, refuse reuse, stay poisoned ---
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let mut call = OverlappedCall::new(bus).expect("CreateEventW");
             call.pending = true;
             let event = call.io.overlapped.hEvent;
@@ -983,7 +947,7 @@ mod tests {
 
         // --- finish: reports poison when cancel/drain times out ---
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let mut call = OverlappedCall::new(bus).expect("CreateEventW");
             call.pending = true;
             let event = call.io.overlapped.hEvent;
@@ -1004,7 +968,7 @@ mod tests {
 
         // --- drop: returns within ~DRAIN_TIMEOUT_MS and leaks the event ---
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let mut call = OverlappedCall::new(bus).expect("CreateEventW should succeed");
             call.pending = true;
             let event = call.io.overlapped.hEvent;
@@ -1033,13 +997,13 @@ mod tests {
         }
     }
 
-    /// Clean drop releases `Arc<BusInner>`; poisoned drop leaks it so the device
+    /// Clean drop releases `Arc<BusHandle>`; poisoned drop leaks it so the device
     /// handle cannot be closed under a live IRP.
     #[test]
     fn arc_release_vs_deliberate_leak() {
         // Clean path.
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let call = OverlappedCall::new(Arc::clone(&bus)).expect("CreateEventW");
             assert_eq!(Arc::strong_count(&bus), 2);
             drop(call);
@@ -1048,7 +1012,7 @@ mod tests {
 
         // Poison path: pending IRP on a dead handle times out the drain.
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let mut call = OverlappedCall::new(Arc::clone(&bus)).expect("CreateEventW");
             call.pending = true;
             let event = call.io.overlapped.hEvent;
@@ -1056,7 +1020,7 @@ mod tests {
             assert_eq!(
                 Arc::strong_count(&bus),
                 2,
-                "poisoned call must leak its Arc<BusInner> so CloseHandle cannot run under a live IRP"
+                "poisoned call must leak its Arc<BusHandle> so CloseHandle cannot run under a live IRP"
             );
             // SAFETY: poisoned Drop skipped CloseHandle; reclaim so the test process does not leak.
             unsafe {
@@ -1071,7 +1035,7 @@ mod tests {
     fn ioctl_wait_is_bounded_when_irp_never_completes() {
         // Non-pending: no wait.
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let mut call = OverlappedCall::new(bus).expect("CreateEventW");
             call.io.transferred = 7;
             assert!(!call.pending);
@@ -1091,7 +1055,7 @@ mod tests {
 
         // Pending + never completes: bounded timeout, no poison.
         {
-            let bus = Arc::new(BusInner::new(HANDLE::default()));
+            let bus = Arc::new(BusHandle::new(HANDLE::default()));
             let mut call = OverlappedCall::new(bus).expect("CreateEventW");
             call.pending = true;
             call.io.overlapped.Internal = STATUS_PENDING;

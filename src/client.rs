@@ -976,9 +976,6 @@ impl Client {
     /// Like [`Self::null_for_tests`], but with an explicit scan cursor
     /// (`1..=SERIAL_SCAN_LIMIT`) for wraparound / start-offset tests.
     pub(crate) fn null_for_tests_with_cursor(max_targets: u32, scan_cursor: u32) -> Self {
-        use crate::internal::overlapped::BusInner;
-        use windows::Win32::Foundation::HANDLE;
-
         debug_assert!(
             (1..=SERIAL_SCAN_LIMIT).contains(&scan_cursor),
             "scan_cursor out of range"
@@ -986,9 +983,7 @@ impl Client {
 
         Self {
             inner: Arc::new(Mutex::new(ClientInner {
-                bus: Bus {
-                    inner: Arc::new(BusInner::new(HANDLE::default())),
-                },
+                bus: Bus::null_for_tests(),
                 targets: HashMap::new(),
                 reserved: HashSet::new(),
                 next_gen: 1,
@@ -1053,13 +1048,8 @@ mod tests {
     ///
     /// Pins `scan_cursor` to `1` and `inflight_plugs` to `0` for determinism.
     fn test_client_inner(live: &[u32], reserved: &[u32], max_targets: u32) -> ClientInner {
-        use crate::internal::overlapped::BusInner;
-        use windows::Win32::Foundation::HANDLE;
-
         ClientInner {
-            bus: Bus {
-                inner: Arc::new(BusInner::new(HANDLE::default())),
-            },
+            bus: Bus::null_for_tests(),
             targets: live.iter().map(|&s| (s, test_target(s))).collect(),
             reserved: reserved.iter().copied().collect(),
             next_gen: 1,
