@@ -7,6 +7,11 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "ds4")]
+pub mod bus_tap;
+#[cfg(feature = "ds4")]
+pub mod hid;
+
 use std::env;
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard, OnceLock};
