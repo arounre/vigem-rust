@@ -19,6 +19,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **DS4 `wait_for_ready` failed on a slow or busy system.** ViGEmBus waits at most 1 s for the
+  host to start a new pad. When the host needed longer, `plug` returned without the driver's
+  confirmation and the pad was still being started: for a moment the driver answered a report
+  with "no such device", then "busy", before the usual `TargetNotReady`. `wait_for_ready` retried
+  only `TargetNotReady`, so it returned `BusError::DeviceGone` or `BusError::Ioctl` (Win32 170)
+  for a pad that accepted reports a few hundred milliseconds later. It now retries all three
+  until a report is accepted or the timeout passes. A pad the driver still does not know at the
+  timeout returns `DeviceGone`, as in the Xbox 360 wait. An `update` sent straight after `plug`
+  without `wait_for_ready` can still see these errors.
 - **DS4 raw output reports went to the wrong pad.** `register_notification_raw_buffer` ran one
   `IOCTL_DS4_AWAIT_OUTPUT_AVAILABLE` listener per pad and assumed every completion was its own.
   The driver ignores the serial in that request and hands each output report, from any DS4 pad on

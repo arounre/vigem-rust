@@ -750,6 +750,10 @@ impl TargetHandle<DualShock4, Pending> {
     /// reports are rejected for a few milliseconds. (The Xbox 360 wait sends no
     /// reports; see [`wait_for_ready`](TargetHandle::wait_for_ready).)
     ///
+    /// On a slow or busy system the host can need longer than the driver's own
+    /// 1 s start-up wait. The driver then answers the first reports with "no
+    /// such device" or "busy" for a moment; those are retried too.
+    ///
     /// Takes `&self`: a timeout does **not** drop this handle or unplug the pad.
     ///
     /// # Errors
@@ -1422,6 +1426,7 @@ impl<'a, T: Device> TargetBuilder<'a, T> {
 mod tests {
     use super::*;
     use crate::client::{Client, TargetSpec};
+    use crate::error::ERROR_BUSY;
     #[cfg(feature = "x360")]
     use crate::error::ERROR_INVALID_DEVICE_OBJECT_PARAMETER;
     use std::cell::RefCell;
@@ -1541,6 +1546,58 @@ mod tests {
             );
             let _ready = handle.assume_ready();
         }
+    }
+
+    /// Sequence measured on ViGEmBus 1.21.442 after a plug the driver did not
+    /// confirm: `DeviceGone` -> busy -> `TargetNotReady` -> accepted.
+    #[test]
+    fn wait_with_probe_retries_ds4_startup_errors() {
+        let client = Client::null_for_tests(4);
+        let handle = pending_pad(&client);
+        let serial = handle.serial_no();
+        let probes = RefCell::new(0u32);
+
+        handle
+            .wait_with_probe(Duration::from_secs(5), |_this| {
+                *probes.borrow_mut() += 1;
+                match *probes.borrow() {
+                    1 => Err(ClientError::Bus(BusError::DeviceGone {
+                        operation: Operation::DS4_SUBMIT_REPORT,
+                        serial_no: Some(serial),
+                    })),
+                    2 => Err(ClientError::Bus(BusError::classify_ioctl(
+                        Operation::DS4_SUBMIT_REPORT,
+                        Some(serial),
+                        crate::error::Win32Error::from_win32(ERROR_BUSY),
+                    ))),
+                    3 => Err(ClientError::Bus(BusError::TargetNotReady {
+                        serial_no: serial,
+                    })),
+                    _ => Ok(()),
+                }
+            })
+            .expect("start-up errors must be retried until a report is accepted");
+        assert_eq!(*probes.borrow(), 4);
+    }
+
+    #[test]
+    fn wait_with_probe_returns_device_gone_at_deadline() {
+        let client = Client::null_for_tests(4);
+        let handle = pending_pad(&client);
+        let serial = handle.serial_no();
+
+        let err = handle
+            .wait_with_probe(Duration::from_millis(30), |_this| {
+                Err(ClientError::Bus(BusError::DeviceGone {
+                    operation: Operation::DS4_SUBMIT_REPORT,
+                    serial_no: Some(serial),
+                }))
+            })
+            .expect_err("a pad the driver never learns about must not become ready");
+        assert!(
+            matches!(err, ClientError::Bus(BusError::DeviceGone { .. })),
+            "expected DeviceGone, got {err:?}"
+        );
     }
 
     #[test]

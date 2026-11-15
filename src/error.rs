@@ -37,7 +37,9 @@ const ERROR_DEV_NOT_EXIST: u32 = 55;
 // Duplicate serial on `VIGEM_PLUGIN_TARGET` (`STATUS_OBJECT_NAME_EXISTS` remapped in
 // `Bus_PlugInDevice`). Also a `Size` mismatch on other ops, so only a slot conflict on plugin.
 const ERROR_INVALID_PARAMETER: u32 = 87;
-const ERROR_BUSY: u32 = 170;
+// A slot conflict on `VIGEM_PLUGIN_TARGET`. From `DS4_SUBMIT_REPORT` it is the Win32 form of
+// `STATUS_DEVICE_BUSY`: the pad is still being started (`ClientError::is_ds4_submit_pending`).
+pub(crate) const ERROR_BUSY: u32 = 170;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_NO_SUCH_DEVICE: u32 = 433;
@@ -759,12 +761,34 @@ impl From<RecvError> for RecvTimeoutError {
 /// Every other failure (access denied, unclassified IOCTL errors, ...) is a
 /// hard error for `wait_for_ready`.
 impl ClientError {
-    /// The DS4 submit probe failed only because the host has no read waiting
-    /// for the pad yet.
+    /// The DS4 submit probe failed only because the pad is still coming up:
+    ///
+    /// - `TargetNotReady`: the host has no read waiting for the pad.
+    /// - `DeviceGone` from the DS4 submit: the driver does not know the serial yet.
+    /// - `ERROR_BUSY` from the DS4 submit: the pad is known but not started.
+    ///
+    /// The last two are seen only when `plug` returned without the driver's
+    /// confirmation (the host needed longer than the driver's 1 s wait, or the
+    /// driver has no `WAIT_DEVICE_READY`). Measured on ViGEmBus 1.21.442 with a
+    /// busy host: `DeviceGone`, then `ERROR_BUSY`, then `TargetNotReady`, then
+    /// accepted, the whole sequence taking from a few milliseconds to ~800 ms
+    /// after `plug` returned (test `ds4_wait_for_ready_survives_slow_host`).
     #[cfg_attr(not(feature = "ds4"), allow(dead_code))]
     #[inline]
     pub(crate) fn is_ds4_submit_pending(&self) -> bool {
-        matches!(self, Self::Bus(BusError::TargetNotReady { .. }))
+        match self {
+            Self::Bus(BusError::TargetNotReady { .. }) => true,
+            Self::Bus(BusError::DeviceGone { operation, .. }) => {
+                *operation == Operation::DS4_SUBMIT_REPORT
+            }
+            Self::Bus(BusError::Ioctl {
+                operation, source, ..
+            }) => {
+                *operation == Operation::DS4_SUBMIT_REPORT
+                    && source.win32_code() == Some(ERROR_BUSY)
+            }
+            _ => false,
+        }
     }
 
     /// The Xbox 360 user-index query failed only because the pad is still coming up:
@@ -1016,6 +1040,45 @@ mod tests {
             err.to_string(),
             bus.to_string(),
             "ReadyTimeout must not look like TargetNotReady"
+        );
+    }
+
+    #[test]
+    fn ds4_submit_pending_is_scoped_to_the_ds4_submit() {
+        let busy = |operation| {
+            ClientError::Bus(BusError::classify_ioctl(
+                operation,
+                Some(1),
+                Win32Error::from_win32(ERROR_BUSY),
+            ))
+        };
+        let gone = |operation| {
+            ClientError::Bus(BusError::DeviceGone {
+                operation,
+                serial_no: Some(1),
+            })
+        };
+        assert!(
+            ClientError::Bus(BusError::TargetNotReady { serial_no: 1 }).is_ds4_submit_pending()
+        );
+        assert!(busy(Operation::DS4_SUBMIT_REPORT).is_ds4_submit_pending());
+        assert!(gone(Operation::DS4_SUBMIT_REPORT).is_ds4_submit_pending());
+        for operation in [
+            Operation::XUSB_SUBMIT_REPORT,
+            Operation::DS4_REQUEST_NOTIFICATION,
+            Operation::PLUGIN_TARGET,
+        ] {
+            assert!(!busy(operation).is_ds4_submit_pending(), "{operation}");
+            assert!(!gone(operation).is_ds4_submit_pending(), "{operation}");
+        }
+        // Another Win32 code from the DS4 submit is not the start-up window.
+        assert!(
+            !ClientError::Bus(BusError::classify_ioctl(
+                Operation::DS4_SUBMIT_REPORT,
+                Some(1),
+                Win32Error::from_win32(ERROR_INVALID_PARAMETER),
+            ))
+            .is_ds4_submit_pending()
         );
     }
 }

@@ -376,6 +376,14 @@ fn ds4_probe_sequence_after_plug() {
         match pad.update(&Ds4Report::default()) {
             Ok(()) => true,
             Err(ClientError::Bus(BusError::TargetNotReady { .. })) => false,
+            // Pad still being started (plug came back without the driver's
+            // confirmation): the same misses `wait_for_ready` retries.
+            Err(ClientError::Bus(BusError::DeviceGone { .. })) => false,
+            Err(ClientError::Bus(BusError::Ioctl { source, .. }))
+                if source.win32_code() == Some(170) =>
+            {
+                false
+            }
             Err(e) => panic!("unexpected update error: {e:?}"),
         }
     }
@@ -860,4 +868,111 @@ fn occupied_serials_sees_pads_and_shrinks_on_unplug() {
             "freed serial {s} still enumerated; snapshot never shrinks?"
         );
     }
+}
+
+/// DS4 `wait_for_ready` succeeds when the host is too slow for the driver's
+/// own 1 s start-up wait.
+///
+/// Other clients plug and unplug pads the whole time, which slows PnP enough
+/// that some plugs come back without the driver's confirmation. The pad is
+/// still coming up then, and for a short while the driver answers a submit
+/// with "no such device" (Win32 55) or "busy" (Win32 170) before it reaches
+/// the usual `TargetNotReady` and then accepts a report. `wait_for_ready`
+/// must wait through all three.
+///
+/// Slow plugs (>= 900 ms) are counted and printed. A run without any did not
+/// exercise the slow path and asserts nothing new; rerun or raise `CHURNERS`.
+///
+/// Run: `cargo test --features "ds4 x360" --test driver_required ds4_wait_for_ready_survives -- --ignored --nocapture`
+#[test]
+#[ignore = "requires ViGEmBus driver"]
+#[cfg(all(feature = "ds4", feature = "x360"))]
+fn ds4_wait_for_ready_survives_slow_host() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const CHURNERS: usize = 12;
+    const PADS_PER_CHURNER: usize = 4;
+    const ROUNDS: usize = 40;
+    const SLOW_PLUG: Duration = Duration::from_millis(900);
+
+    let _guard = driver_lock();
+    let client = Client::connect().expect("ViGEmBus must be installed for this test");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let churners: Vec<_> = (0..CHURNERS)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let Ok(client) = Client::connect() else {
+                    return;
+                };
+                while !stop.load(Ordering::Acquire) {
+                    // Errors are expected here (serial window full, slow host).
+                    let x360: Vec<_> = (0..PADS_PER_CHURNER / 2)
+                        .filter_map(|_| client.new_x360_target().plug().ok())
+                        .collect();
+                    let ds4: Vec<_> = (0..PADS_PER_CHURNER / 2)
+                        .filter_map(|_| client.new_ds4_target().plug().ok())
+                        .collect();
+                    drop(x360);
+                    drop(ds4);
+                }
+            })
+        })
+        .collect();
+
+    let mut slow = 0usize;
+    let mut plug_failed = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for round in 0..ROUNDS {
+        let started = Instant::now();
+        let pending = match client.new_ds4_target().plug() {
+            Ok(p) => p,
+            Err(e) => {
+                // Not what this test is about; the churn can fill the window.
+                plug_failed += 1;
+                eprintln!("round {round}: plug failed: {e:?}");
+                continue;
+            }
+        };
+        let plug_time = started.elapsed();
+        let was_slow = plug_time >= SLOW_PLUG;
+        slow += usize::from(was_slow);
+        let waited = Instant::now();
+        match pending.wait_for_ready() {
+            Ok(ready) => {
+                if was_slow {
+                    eprintln!(
+                        "round {round}: slow plug {plug_time:.0?}, ready after {:.1?}",
+                        waited.elapsed()
+                    );
+                }
+                drop(ready);
+            }
+            Err(e) => {
+                eprintln!("round {round}: plug {plug_time:.0?}, wait_for_ready failed: {e:?}");
+                failures.push(format!("round {round} (plug {plug_time:.0?}): {e:?}"));
+            }
+        }
+        drop(pending);
+    }
+
+    stop.store(true, Ordering::Release);
+    for c in churners {
+        let _ = c.join();
+    }
+
+    eprintln!(
+        "ds4 wait_for_ready under churn: {ROUNDS} rounds, {slow} slow plugs, \
+         {plug_failed} plugs failed, {} wait_for_ready failures",
+        failures.len()
+    );
+    if slow == 0 {
+        eprintln!("no slow plug provoked in this run; the slow path was not exercised");
+    }
+    assert!(
+        failures.is_empty(),
+        "wait_for_ready failed on a pad that was still coming up: {failures:#?}"
+    );
 }
