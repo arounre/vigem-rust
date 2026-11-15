@@ -60,53 +60,6 @@ use crate::{
     },
 };
 
-#[cfg_attr(not(feature = "ds4"), allow(dead_code))]
-#[inline]
-fn is_retryable_ready_error(err: &ClientError) -> bool {
-    matches!(err, ClientError::Bus(BusError::TargetNotReady { .. }))
-}
-
-/// Win32 form of `STATUS_INVALID_DEVICE_OBJECT_PARAMETER`.
-///
-/// `IOCTL_XUSB_GET_USER_INDEX` fails with it until the host has sent the pad
-/// an LED packet that assigns XInput slot 0..=3.
-#[cfg(feature = "x360")]
-const ERROR_INVALID_DEVICE_OBJECT_PARAMETER: u32 = 650;
-
-/// Does `err` carry `code` from `XUSB_GET_USER_INDEX`?
-#[cfg(feature = "x360")]
-#[inline]
-fn is_user_index_code(err: &ClientError, code: u32) -> bool {
-    matches!(
-        err,
-        ClientError::Bus(BusError::Ioctl { operation, source, .. })
-            if *operation == Operation::XUSB_GET_USER_INDEX && source.win32_code() == Some(code)
-    )
-}
-
-/// The Xbox 360 user-index query failed only because the pad is still coming up:
-///
-/// - `ERROR_INVALID_DEVICE_OBJECT_PARAMETER`: the host has not assigned a slot yet.
-/// - `DeviceGone`: for about the first millisecond after `PLUGIN_TARGET` the
-///   driver does not know the serial yet. Without `WAIT_DEVICE_READY`, `plug`
-///   returns inside that window. The wait checks this client's own liveness
-///   flag every round, so a real unplug still ends it, and if the driver
-///   still says `DeviceGone` when the deadline passes the wait returns that
-///   error instead of `ReadyTimeout`.
-///
-/// Every other failure (access denied, unclassified IOCTL errors, ...) is a
-/// hard error for `wait_for_ready`.
-#[cfg(feature = "x360")]
-#[inline]
-fn is_user_index_pending(err: &ClientError) -> bool {
-    is_user_index_code(err, ERROR_INVALID_DEVICE_OBJECT_PARAMETER)
-        || matches!(
-            err,
-            ClientError::Bus(BusError::DeviceGone { operation, .. })
-                if *operation == Operation::XUSB_GET_USER_INDEX
-        )
-}
-
 /// Map a user-index query result to a readiness probe result.
 ///
 /// Any success means the host has assigned a slot, whether or not the driver
@@ -647,7 +600,7 @@ impl<T: Device> TargetHandle<T, Pending> {
         timeout: Duration,
         probe: impl FnMut(&Self) -> Result<(), ClientError>,
     ) -> Result<TargetHandle<T, Ready>, ClientError> {
-        self.poll_until_ready(timeout, is_retryable_ready_error, probe)
+        self.poll_until_ready(timeout, ClientError::is_ds4_submit_pending, probe)
     }
 
     /// Retry `probe` until it succeeds once, or the wait gives up.
@@ -768,7 +721,7 @@ impl TargetHandle<Xbox360, Pending> {
     /// [`Self::wait_for_ready_timeout`] with an injectable user-index probe.
     ///
     /// Confirmed at plug (or by an earlier wait): liveness check only.
-    /// Otherwise poll until one success; only [`is_user_index_pending`] errors
+    /// Otherwise poll until one success; only [`ClientError::is_user_index_pending`] errors
     /// are retried. A success is remembered for every clone of this pad.
     fn wait_x360_with(
         &self,
@@ -779,7 +732,7 @@ impl TargetHandle<Xbox360, Pending> {
             self.assert_live()?;
             return Ok(self.as_ready());
         }
-        let ready = self.poll_until_ready(timeout, is_user_index_pending, probe)?;
+        let ready = self.poll_until_ready(timeout, ClientError::is_user_index_pending, probe)?;
         self.inner.ready_confirmed.store(true, Ordering::Release);
         Ok(ready)
     }
@@ -1469,6 +1422,8 @@ impl<'a, T: Device> TargetBuilder<'a, T> {
 mod tests {
     use super::*;
     use crate::client::{Client, TargetSpec};
+    #[cfg(feature = "x360")]
+    use crate::error::ERROR_INVALID_DEVICE_OBJECT_PARAMETER;
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
 
@@ -1948,11 +1903,11 @@ mod tests {
             ERROR_INVALID_DEVICE_OBJECT_PARAMETER,
         )))
         .expect_err("650 is not ready");
-        assert!(is_user_index_pending(&pending));
+        assert!(pending.is_user_index_pending());
         // 122 is an ordinary driver error, not "assigned" and not retryable.
         let hard = user_index_probe(Err(ioctl(Operation::XUSB_GET_USER_INDEX, 122)))
             .expect_err("122 is a hard error");
-        assert!(!is_user_index_pending(&hard));
+        assert!(!hard.is_user_index_pending());
     }
 
     const fn assert_send_sync<T: Send + Sync>() {}

@@ -17,10 +17,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
     SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
 };
-use windows::Win32::Foundation::{
-    ERROR_DEVICE_HARDWARE_ERROR, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
-    ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED, ERROR_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
-};
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
     FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -88,17 +85,8 @@ const _: () = assert!(DETAIL_DATA_CB_SIZE == 8);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(DETAIL_DATA_CB_SIZE == 6);
 
-/// Whether a `CHECK_VERSION` failure is the driver rejecting our version.
-///
-/// The driver reports a mismatch only as `STATUS_NOT_SUPPORTED`
-/// (`ERROR_NOT_SUPPORTED`); any other failure (timeout, device gone, malformed
-/// request) is not a version problem.
-fn is_version_mismatch(e: Win32Error) -> bool {
-    e.win32_code() == Some(ERROR_NOT_SUPPORTED.0)
-}
-
 /// Access denied wins; else `VersionMismatch` if `CHECK_VERSION` failed with
-/// `ERROR_NOT_SUPPORTED` (see [`is_version_mismatch`]); else `BusNotFound` (with
+/// `ERROR_NOT_SUPPORTED` (see [`Win32Error::is_version_mismatch`]); else `BusNotFound` (with
 /// last error if an interface was seen).
 fn classify_connect_failure(
     saw_interface: bool,
@@ -361,33 +349,12 @@ pub(crate) enum PlugReadiness {
     Unknown,
 }
 
-/// Older drivers may not implement `IOCTL_VIGEM_WAIT_DEVICE_READY`.
-fn is_optional_wait_device_ready_error(err: &windows::core::Error) -> bool {
-    let code = err.code();
-    code == ERROR_INVALID_PARAMETER.to_hresult()
-        || code == ERROR_NOT_SUPPORTED.to_hresult()
-        || code == ERROR_INVALID_FUNCTION.to_hresult()
-}
-
-/// ViGEmBus waits at most 1 s for the host to start a new pad, then completes
-/// `WAIT_DEVICE_READY` with `STATUS_DEVICE_HARDWARE_ERROR`
-/// (`ERROR_DEVICE_HARDWARE_ERROR`, 483). The pad still exists and may become
-/// usable once the host catches up (for example on a slow or busy system).
-fn is_wait_device_ready_driver_timeout(err: &windows::core::Error) -> bool {
-    err.code() == ERROR_DEVICE_HARDWARE_ERROR.to_hresult()
-}
-
 /// What a failed `WAIT_DEVICE_READY` means for the plug: `Some(Unknown)` keeps
 /// the pad and leaves the decision to `wait_for_ready`; `None` fails the plug.
 fn readiness_after_wait_error(err: &windows::core::Error) -> Option<PlugReadiness> {
-    (is_optional_wait_device_ready_error(err) || is_wait_device_ready_driver_timeout(err))
+    let err = Win32Error::from_hresult(err.code().0);
+    (err.is_wait_device_ready_unsupported() || err.is_wait_device_ready_driver_timeout())
         .then_some(PlugReadiness::Unknown)
-}
-
-/// Our own bounded wait in [`OverlappedCall`] gave up (`ERROR_TIMEOUT`). The
-/// driver never reports this code, and the IRP may still have succeeded.
-fn is_local_ioctl_timeout(err: &windows::core::Error) -> bool {
-    err.code() == ERROR_TIMEOUT.to_hresult()
 }
 
 #[inline]
@@ -400,12 +367,6 @@ fn map_ioctl(
 
 /// Consecutive transient failures before ending a notification subscription.
 const NOTIFICATION_MAX_CONSECUTIVE_FAILURES: u32 = 8;
-
-/// Fatal notification error: bus device gone (not drop-driven ABORTED).
-#[inline]
-fn is_fatal_notification_error(err: &BusError) -> bool {
-    matches!(err, BusError::DeviceGone { .. })
-}
 
 impl Bus {
     pub(crate) fn connect() -> Result<Self, BusError> {
@@ -542,7 +503,7 @@ impl Bus {
                     let e = Win32Error::from(e);
                     // Only the driver's real mismatch status counts; a timeout or a
                     // device that vanished mid-connect surfaces as BusNotFound.
-                    version_mismatch |= is_version_mismatch(e);
+                    version_mismatch |= e.is_version_mismatch();
                     last_error = Some(e);
                 }
             }
@@ -592,7 +553,7 @@ impl Bus {
             )
         };
         if let Err(e) = plugin_result {
-            if is_local_ioctl_timeout(&e) {
+            if Win32Error::from_hresult(e.code().0).is_local_ioctl_timeout() {
                 // The call has been cancelled and drained by now; if the driver
                 // created the pad anyway, nobody would own it. Unplug only
                 // touches this handle's pads, and the serial is still ours.
@@ -903,7 +864,7 @@ impl Bus {
                             break;
                         }
 
-                        if is_fatal_notification_error(&bus_err) {
+                        if bus_err.is_fatal_notification_error() {
                             let _ = sink.deliver(Err(bus_err));
                             break;
                         }
@@ -1126,9 +1087,9 @@ impl Bus {
         if io.finish() {
             // Never free or read response after poison (kernel may still write it).
             return Err(map_ioctl(Operation::XUSB_GET_USER_INDEX, Some(serial_no))(
-                ioctl_result
-                    .err()
-                    .unwrap_or_else(|| windows::core::Error::from(ERROR_TIMEOUT)),
+                ioctl_result.err().unwrap_or_else(|| {
+                    windows::core::Error::from(windows::Win32::Foundation::ERROR_TIMEOUT)
+                }),
             ));
         }
 
@@ -1203,6 +1164,7 @@ impl core::iter::FusedIterator for DeviceInterfaceIterator {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::ERROR_TIMEOUT;
 
     fn win32(code: u32) -> windows::core::Error {
         windows::core::Error::from(windows::Win32::Foundation::WIN32_ERROR(code))
@@ -1233,12 +1195,22 @@ mod tests {
     /// Only our own wait timeout triggers the cleanup unplug.
     #[test]
     fn local_ioctl_timeout_is_error_timeout_only() {
-        assert!(is_local_ioctl_timeout(&windows::core::Error::new(
-            ERROR_TIMEOUT.to_hresult(),
-            "OverlappedCall: IOCTL wait timed out; IRP still pending",
-        )));
+        assert!(
+            Win32Error::from_hresult(
+                windows::core::Error::new(
+                    ERROR_TIMEOUT.to_hresult(),
+                    "OverlappedCall: IOCTL wait timed out; IRP still pending",
+                )
+                .code()
+                .0
+            )
+            .is_local_ioctl_timeout()
+        );
         for code in [87, 183, 5, 55, 483, 995, 121] {
-            assert!(!is_local_ioctl_timeout(&win32(code)), "code {code}");
+            assert!(
+                !Win32Error::from_hresult(win32(code).code().0).is_local_ioctl_timeout(),
+                "code {code}"
+            );
         }
     }
 
@@ -1248,7 +1220,7 @@ mod tests {
             operation: Operation::XUSB_REQUEST_NOTIFICATION,
             serial_no: Some(1),
         };
-        assert!(is_fatal_notification_error(&gone));
+        assert!(gone.is_fatal_notification_error());
 
         let aborted = BusError::classify_ioctl(
             Operation::XUSB_REQUEST_NOTIFICATION,
@@ -1256,7 +1228,7 @@ mod tests {
             Win32Error::from_win32(995), // ERROR_OPERATION_ABORTED
         );
         assert!(
-            !is_fatal_notification_error(&aborted),
+            !aborted.is_fatal_notification_error(),
             "ABORT is handled via shutdown flag, not as a fatal bus death"
         );
         assert!(
@@ -1270,14 +1242,14 @@ mod tests {
             Some(1),
             Win32Error::from_win32(87), // ERROR_INVALID_PARAMETER
         );
-        assert!(!is_fatal_notification_error(&invalid));
+        assert!(!invalid.is_fatal_notification_error());
 
         let classified = BusError::classify_ioctl(
             Operation::XUSB_REQUEST_NOTIFICATION,
             Some(1),
             Win32Error::from_win32(433), // ERROR_NO_SUCH_DEVICE
         );
-        assert!(is_fatal_notification_error(&classified));
+        assert!(classified.is_fatal_notification_error());
     }
 
     #[test]
@@ -1344,8 +1316,8 @@ mod tests {
             (995, false),  // ERROR_OPERATION_ABORTED
         ] {
             let e = Win32Error::from_win32(code);
-            assert_eq!(is_version_mismatch(e), expect_mismatch, "code {code}");
-            match classify_connect_failure(true, is_version_mismatch(e), Some(e)) {
+            assert_eq!(e.is_version_mismatch(), expect_mismatch, "code {code}");
+            match classify_connect_failure(true, e.is_version_mismatch(), Some(e)) {
                 BusError::VersionMismatch { requested } if expect_mismatch => {
                     assert_eq!(requested, VIGEM_COMMON_VERSION);
                 }

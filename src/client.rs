@@ -53,7 +53,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::error::{BusError, ClientError, Operation};
+use crate::error::{BusError, ClientError};
 use crate::internal::bus::{Bus, PlugReadiness};
 #[cfg(feature = "ds4")]
 use crate::target::DualShock4;
@@ -338,21 +338,6 @@ fn find_free_serial(
 #[inline]
 const fn next_cursor(serial_no: u32) -> u32 {
     (serial_no % SERIAL_SCAN_LIMIT) + 1
-}
-
-/// `true` if a plug error means "that serial is taken" and the scan should advance.
-///
-/// Scoped to [`Operation::PLUGIN_TARGET`]. Includes `ERROR_INVALID_PARAMETER`,
-/// which is what ViGEmBus returns for a duplicate serial (`Bus_PlugInDevice`
-/// remaps `STATUS_OBJECT_NAME_EXISTS`). On any other operation that code means a
-/// malformed request and is **not** retryable.
-pub(crate) fn is_retryable_plug_error(err: &BusError) -> bool {
-    match err {
-        BusError::Ioctl {
-            operation, source, ..
-        } if *operation == Operation::PLUGIN_TARGET => source.is_plug_serial_conflict(),
-        _ => false,
-    }
 }
 
 /// Connection to the ViGEmBus driver and the virtual controllers you create on it.
@@ -892,7 +877,7 @@ impl Client {
                         readiness,
                     ));
                 }
-                Err(e) if is_retryable_plug_error(&e) => {
+                Err(e) if e.is_retryable_plug_error() => {
                     burned.push(serial_no);
                     last_retryable = Some(e);
                     {
@@ -1012,6 +997,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Operation;
     use crate::error::Win32Error;
     use crate::target::TestPad;
 
@@ -1118,51 +1104,38 @@ mod tests {
     #[test]
     fn retryable_plug_error_matrix() {
         // Retryable: slot conflicts on PLUGIN_TARGET only.
-        assert!(is_retryable_plug_error(&ioctl_err(
-            Operation::PLUGIN_TARGET,
-            ERROR_BUSY
-        )));
-        assert!(is_retryable_plug_error(&ioctl_err(
-            Operation::PLUGIN_TARGET,
-            ERROR_ALREADY_EXISTS
-        )));
+        assert!(ioctl_err(Operation::PLUGIN_TARGET, ERROR_BUSY).is_retryable_plug_error());
+        assert!(
+            ioctl_err(Operation::PLUGIN_TARGET, ERROR_ALREADY_EXISTS).is_retryable_plug_error()
+        );
         // ViGEmBus: occupied serial -> STATUS_INVALID_PARAMETER (Win32 87).
-        assert!(is_retryable_plug_error(&ioctl_err(
-            Operation::PLUGIN_TARGET,
-            ERROR_INVALID_PARAMETER
-        )));
+        assert!(
+            ioctl_err(Operation::PLUGIN_TARGET, ERROR_INVALID_PARAMETER).is_retryable_plug_error()
+        );
 
         // Non-retryable: wrong operation, wrong code, or non-Ioctl variants.
-        assert!(!is_retryable_plug_error(&ioctl_err(
-            Operation::WAIT_DEVICE_READY,
-            ERROR_BUSY
-        )));
-        assert!(!is_retryable_plug_error(&ioctl_err(
-            Operation::WAIT_DEVICE_READY,
-            ERROR_INVALID_PARAMETER
-        )));
-        assert!(!is_retryable_plug_error(&ioctl_err(
-            Operation::PLUGIN_TARGET,
-            ERROR_ACCESS_DENIED
-        )));
+        assert!(!ioctl_err(Operation::WAIT_DEVICE_READY, ERROR_BUSY).is_retryable_plug_error());
+        assert!(
+            !ioctl_err(Operation::WAIT_DEVICE_READY, ERROR_INVALID_PARAMETER)
+                .is_retryable_plug_error()
+        );
+        assert!(
+            !ioctl_err(Operation::PLUGIN_TARGET, ERROR_ACCESS_DENIED).is_retryable_plug_error()
+        );
         assert!(matches!(
             ioctl_err(Operation::PLUGIN_TARGET, ERROR_ACCESS_DENIED),
             BusError::AccessDenied { .. }
         ));
-        assert!(!is_retryable_plug_error(&ioctl_err(
-            Operation::PLUGIN_TARGET,
-            ERROR_GEN_FAILURE
-        )));
-        assert!(!is_retryable_plug_error(&BusError::BusNotFound {
-            source: None
-        }));
-        assert!(!is_retryable_plug_error(&BusError::VersionMismatch {
-            requested: 0x0001
-        }));
-        assert!(!is_retryable_plug_error(&BusError::DeviceGone {
-            operation: Operation::PLUGIN_TARGET,
-            serial_no: Some(1),
-        }));
+        assert!(!ioctl_err(Operation::PLUGIN_TARGET, ERROR_GEN_FAILURE).is_retryable_plug_error());
+        assert!(!BusError::BusNotFound { source: None }.is_retryable_plug_error());
+        assert!(!BusError::VersionMismatch { requested: 0x0001 }.is_retryable_plug_error());
+        assert!(
+            !BusError::DeviceGone {
+                operation: Operation::PLUGIN_TARGET,
+                serial_no: Some(1),
+            }
+            .is_retryable_plug_error()
+        );
     }
 
     /// Client Arc refcount controls pad lifetime: clones keep pads alive; the

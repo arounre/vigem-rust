@@ -27,8 +27,11 @@ use std::time::Duration;
 use thiserror::Error;
 
 // Win32 codes as raw `u32` so this module does not name `windows` types in the public API.
+const ERROR_INVALID_FUNCTION: u32 = 1;
 pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
+// `STATUS_NOT_SUPPORTED`: the driver's answer to a `CHECK_VERSION` it rejects.
+const ERROR_NOT_SUPPORTED: u32 = 50;
 // `STATUS_DEVICE_DOES_NOT_EXIST` -> Win32 55; ViGEm unknown / never-plugged serial.
 const ERROR_DEV_NOT_EXIST: u32 = 55;
 // Duplicate serial on `VIGEM_PLUGIN_TARGET` (`STATUS_OBJECT_NAME_EXISTS` remapped in
@@ -38,8 +41,16 @@ const ERROR_BUSY: u32 = 170;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_NO_SUCH_DEVICE: u32 = 433;
+// Win32 form of `STATUS_INVALID_DEVICE_OBJECT_PARAMETER`. `IOCTL_XUSB_GET_USER_INDEX` fails
+// with it until the host has sent the pad an LED packet that assigns XInput slot 0..=3.
+#[cfg(feature = "x360")]
+pub(crate) const ERROR_INVALID_DEVICE_OBJECT_PARAMETER: u32 = 650;
+// `STATUS_DEVICE_HARDWARE_ERROR`: the driver's 1 s `WAIT_DEVICE_READY` ran out.
+const ERROR_DEVICE_HARDWARE_ERROR: u32 = 483;
 const ERROR_OPERATION_ABORTED: u32 = 995;
 const ERROR_DEVICE_NOT_CONNECTED: u32 = 1167;
+// Never from the driver: `OverlappedCall`'s own bounded wait gave up.
+const ERROR_TIMEOUT: u32 = 1460;
 
 // `FACILITY_WIN32` (`HRESULT_FROM_WIN32` sets severity + facility 7).
 const FACILITY_WIN32: i32 = 7;
@@ -100,6 +111,46 @@ impl Win32Error {
     #[must_use]
     pub(crate) const fn is_operation_aborted(self) -> bool {
         matches!(self.win32_code(), Some(ERROR_OPERATION_ABORTED))
+    }
+
+    /// Whether a `CHECK_VERSION` failure is the driver rejecting our version.
+    ///
+    /// The driver reports a mismatch only as `STATUS_NOT_SUPPORTED`
+    /// (`ERROR_NOT_SUPPORTED`); any other failure (timeout, device gone, malformed
+    /// request) is not a version problem.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_version_mismatch(self) -> bool {
+        matches!(self.win32_code(), Some(ERROR_NOT_SUPPORTED))
+    }
+
+    /// `WAIT_DEVICE_READY` failed because the driver does not implement it
+    /// (older drivers).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_wait_device_ready_unsupported(self) -> bool {
+        matches!(
+            self.win32_code(),
+            Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)
+        )
+    }
+
+    /// ViGEmBus waits at most 1 s for the host to start a new pad, then completes
+    /// `WAIT_DEVICE_READY` with `STATUS_DEVICE_HARDWARE_ERROR`
+    /// (`ERROR_DEVICE_HARDWARE_ERROR`, 483). The pad still exists and may become
+    /// usable once the host catches up (for example on a slow or busy system).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_wait_device_ready_driver_timeout(self) -> bool {
+        matches!(self.win32_code(), Some(ERROR_DEVICE_HARDWARE_ERROR))
+    }
+
+    /// Our own bounded wait in `OverlappedCall` gave up (`ERROR_TIMEOUT`). The
+    /// driver never reports this code, and the IRP may still have succeeded.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_local_ioctl_timeout(self) -> bool {
+        matches!(self.win32_code(), Some(ERROR_TIMEOUT))
     }
 
     /// Narrow slot-conflict codes: `ERROR_BUSY` and `ERROR_ALREADY_EXISTS`.
@@ -407,6 +458,29 @@ pub enum BusError {
 }
 
 impl BusError {
+    /// `true` if a plug error means "that serial is taken" and the scan should advance.
+    ///
+    /// Scoped to [`Operation::PLUGIN_TARGET`]. Includes `ERROR_INVALID_PARAMETER`,
+    /// which is what ViGEmBus returns for a duplicate serial (`Bus_PlugInDevice`
+    /// remaps `STATUS_OBJECT_NAME_EXISTS`). On any other operation that code means a
+    /// malformed request and is **not** retryable.
+    #[inline]
+    pub(crate) fn is_retryable_plug_error(&self) -> bool {
+        match self {
+            Self::Ioctl {
+                operation, source, ..
+            } if *operation == Operation::PLUGIN_TARGET => source.is_plug_serial_conflict(),
+            _ => false,
+        }
+    }
+
+    /// Fatal for a notification subscription: the bus device is gone (not a
+    /// drop-driven `ERROR_OPERATION_ABORTED`).
+    #[inline]
+    pub(crate) fn is_fatal_notification_error(&self) -> bool {
+        matches!(self, Self::DeviceGone { .. })
+    }
+
     #[inline]
     pub(crate) fn from_ioctl(
         operation: Operation,
@@ -673,6 +747,46 @@ impl From<RecvError> for RecvTimeoutError {
         match err {
             RecvError::Disconnected => Self::Disconnected,
             RecvError::Bus(e) => Self::Bus(e),
+        }
+    }
+}
+
+/// Which errors mean "the pad is still coming up" to `wait_for_ready`.
+///
+/// Both waits check this client's own liveness flag every round, so a real
+/// unplug still ends them, and if the driver still says `DeviceGone` when the
+/// deadline passes the wait returns that error instead of `ReadyTimeout`.
+/// Every other failure (access denied, unclassified IOCTL errors, ...) is a
+/// hard error for `wait_for_ready`.
+impl ClientError {
+    /// The DS4 submit probe failed only because the host has no read waiting
+    /// for the pad yet.
+    #[cfg_attr(not(feature = "ds4"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn is_ds4_submit_pending(&self) -> bool {
+        matches!(self, Self::Bus(BusError::TargetNotReady { .. }))
+    }
+
+    /// The Xbox 360 user-index query failed only because the pad is still coming up:
+    ///
+    /// - `ERROR_INVALID_DEVICE_OBJECT_PARAMETER`: the host has not assigned a slot yet.
+    /// - `DeviceGone`: for about the first millisecond after `PLUGIN_TARGET` the
+    ///   driver does not know the serial yet. Without `WAIT_DEVICE_READY`, `plug`
+    ///   returns inside that window.
+    #[cfg(feature = "x360")]
+    #[inline]
+    pub(crate) fn is_user_index_pending(&self) -> bool {
+        match self {
+            Self::Bus(BusError::DeviceGone { operation, .. }) => {
+                *operation == Operation::XUSB_GET_USER_INDEX
+            }
+            Self::Bus(BusError::Ioctl {
+                operation, source, ..
+            }) => {
+                *operation == Operation::XUSB_GET_USER_INDEX
+                    && source.win32_code() == Some(ERROR_INVALID_DEVICE_OBJECT_PARAMETER)
+            }
+            _ => false,
         }
     }
 }
