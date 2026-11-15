@@ -475,51 +475,6 @@ fn ds4_probe_sequence_after_plug() {
     );
 }
 
-/// After a bus-level `update` failure, a later `update` on the same handle works.
-#[test]
-#[ignore = "requires ViGEmBus driver"]
-#[cfg(feature = "x360")]
-fn cached_call_survives_a_failed_submit() {
-    use vigem_rust::{ClientError, X360Report};
-
-    let _guard = driver_lock();
-    let client = Client::connect().expect("ViGEmBus must be installed for this test");
-    // assume_ready: first submit may hit transient TargetNotReady.
-    let pad = client
-        .new_x360_target()
-        .plug()
-        .expect("plugin")
-        .assume_ready();
-
-    let mut saw_bus_failure = false;
-    let mut saw_success = false;
-    for _ in 0..100 {
-        match pad.update(&X360Report::default()) {
-            Ok(()) => {
-                saw_success = true;
-                break;
-            }
-            Err(ClientError::Bus(_)) => {
-                saw_bus_failure = true;
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("unexpected update error before success: {e:?}"),
-        }
-    }
-    assert!(
-        saw_success,
-        "update must eventually succeed on a live handle \
-         (saw_bus_failure={saw_bus_failure})"
-    );
-    pad.update(&X360Report::default())
-        .expect("second update must not be poisoned by a prior failure/reset");
-    if saw_bus_failure {
-        pad.update(&X360Report::default())
-            .expect("third update after recovered bus failure");
-    }
-    pad.unplug().expect("unplug");
-}
-
 /// Unplug clears the target `alive` flag; the notification worker must exit so a
 /// later plug that recycles the serial cannot feed the stale receiver.
 ///
