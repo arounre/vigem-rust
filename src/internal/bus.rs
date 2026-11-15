@@ -1456,7 +1456,7 @@ mod tests {
         }
 
         let bus = Bus::connect().expect("ViGEmBus must be installed for this test");
-        let arc_baseline = Arc::strong_count(&bus.inner);
+        let arc_baseline = Arc::strong_count(bus.handle());
 
         // Warm one cycle so thread/CRT allocations settle before sampling baseline.
         {
@@ -1489,12 +1489,12 @@ mod tests {
                 )
                 .expect("spawn notification worker");
             assert!(
-                Arc::strong_count(&bus.inner) > arc_baseline,
+                Arc::strong_count(bus.handle()) > arc_baseline,
                 "worker/handle should hold at least one extra Arc clone while alive"
             );
             drop(handle);
             assert_eq!(
-                Arc::strong_count(&bus.inner),
+                Arc::strong_count(bus.handle()),
                 arc_baseline,
                 "worker / handle must release all Arc clones after drop (cycle {i})"
             );
@@ -1512,7 +1512,7 @@ mod tests {
             "handle count after 50 cycles: baseline={handle_baseline}, final={final_count}"
         );
         assert_eq!(
-            Arc::strong_count(&bus.inner),
+            Arc::strong_count(bus.handle()),
             arc_baseline,
             "Arc count must return to baseline after 50 spawn/drop cycles"
         );
